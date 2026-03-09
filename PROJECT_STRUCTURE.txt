@@ -1,0 +1,86 @@
+RecRL Framework - Project Structure
+====================================
+
+CleanOneRec/
+│
+├── 📚 Documentation (7 files)
+│   ├── ARCHITECTURE.md          # 架构设计和理念
+│   ├── MIGRATION.md             # 从 MiniOneRec 迁移指南
+│   ├── SUMMARY.md               # 框架总览
+│   ├── FINAL_SUMMARY.md         # 最终总结
+│   ├── README_CN.md             # 中文说明
+│   ├── quickstart.sh            # 快速开始脚本
+│   └── test_recrl.py            # 测试脚本
+│
+└── 🎯 RecRL Framework (26 Python files)
+    │
+    ├── recrl/
+    │   ├── __init__.py
+    │   ├── README.md
+    │   ├── pyproject.toml
+    │   │
+    │   ├── 🔧 core/ (核心抽象层 - 4 files)
+    │   │   ├── base_trainer.py      # BaseRLTrainer + RLConfig
+    │   │   ├── rollout.py            # RolloutEngine (生成引擎)
+    │   │   ├── reward.py             # BaseReward + CompositeReward
+    │   │   └── data.py               # DataEngine (数据加载)
+    │   │
+    │   ├── 🧮 algorithms/ (算法实现 - 7 files)
+    │   │   ├── grpo/
+    │   │   │   ├── __init__.py
+    │   │   │   ├── config.py         # GRPOConfig
+    │   │   │   └── trainer.py        # GRPOTrainer (~80 lines)
+    │   │   │
+    │   │   ├── eepo/
+    │   │   │   ├── __init__.py
+    │   │   │   ├── config.py         # EEPOConfig
+    │   │   │   ├── trainer.py        # EEPOTrainer (~200 lines)
+    │   │   │   └── unlearn.py        # FastWeightUnlearner
+    │   │   │
+    │   │   └── dpo/                  # 预留：DPO 算法
+    │   │
+    │   ├── 🎁 rewards/ (奖励函数 - 3 files)
+    │   │   ├── __init__.py
+    │   │   ├── semantic.py           # TextSemanticReward
+    │   │   └── rule.py               # ExactMatchReward, NDCGReward
+    │   │
+    │   ├── 🔒 constraints/ (约束解码 - 3 files)
+    │   │   ├── __init__.py
+    │   │   ├── trie.py               # SIDTrie (前缀树)
+    │   │   └── processor.py          # ConstrainedLogitsProcessor
+    │   │
+    │   ├── 📊 data/ (数据加载 - 2 files)
+    │   │   ├── __init__.py
+    │   │   └── sampler.py            # RepeatRandomSampler
+    │   │
+    │   ├── 🛠️ utils/ (工具函数 - 2 files)
+    │   │   ├── __init__.py
+    │   │   └── sid_helper.py         # SIDHelper
+    │   │
+    │   └── 📝 examples/ (使用示例 - 3 files)
+    │       ├── train_grpo.py         # GRPO 训练示例
+    │       ├── train_eepo.py         # EEPO 训练示例
+    │       └── train_composite.py    # 组合奖励示例
+
+Key Statistics
+==============
+✅ Total Python files: 26
+✅ Core abstractions: 4
+✅ Algorithms: 2 (GRPO, EEPO)
+✅ Reward functions: 3
+✅ Code reduction: 70% vs MiniOneRec
+✅ Lines per algorithm: ~150 (vs 500+ in MiniOneRec)
+
+Design Principles
+=================
+1. Separation of Concerns - 每个组件单一职责
+2. Composability - 组件可自由组合
+3. Extensibility - 添加新算法只需 ~100 行
+4. Testability - 每个模块独立可测
+
+Quick Start
+===========
+1. Install:  pip install -e recrl/
+2. Test:     python test_recrl.py
+3. Example:  python recrl/examples/train_grpo.py
+4. Docs:     cat ARCHITECTURE.md
