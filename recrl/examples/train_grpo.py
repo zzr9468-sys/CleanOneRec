@@ -20,33 +20,39 @@ logger = logging.getLogger(__name__)
 
 def main():
     # Configuration
-    model_path = "gpt2" # Using dummy model for test
-    train_file = "dummy_train" 
-    recif_path = "dummy_recif"
-    output_dir = "./outputs/grpo_test_mac"
+    model_path = "path/to/your/model"
+    train_file = "path/to/train.parquet"
+    recif_path = "path/to/OpenOneRec-RecIF"
+    output_dir = "./outputs/grpo"
 
-    device = "cpu" # Forced to CPU for quick test
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load model and tokenizer
     logger.info(f"Loading model from {model_path}")
-    model = AutoModelForCausalLM.from_pretrained(model_path)
-    
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
-        model.config.pad_token_id = model.config.eos_token_id
 
     # Create reference model (frozen copy)
-    ref_model = AutoModelForCausalLM.from_pretrained(model_path)
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto"
+    )
     ref_model.eval()
 
-    # Create a tiny dummy dataset
-    logger.info(f"Creating dummy dataset")
-    from datasets import Dataset
-    train_dataset = Dataset.from_dict({
-        "prompt": ["### User Input:\nRecommend item.\n### Response:\n", "### User Input:\nNext item?\n### Response:\n"],
-        "target_sid": ["<s_a_1><s_b_2><s_c_3>", "<s_a_4><s_b_5><s_c_6>"]
-    })
+    # Load dataset
+    logger.info(f"Loading dataset from {train_file}")
+    train_dataset = DataEngine.from_parquet(
+        path=train_file,
+        format="recif",
+        sample_num=1000  # Use -1 for full dataset
+    )
 
     # Setup rollout engine
     rollout_engine = RolloutEngine(
@@ -55,19 +61,21 @@ def main():
         device=device
     )
 
-    # Setup dummy reward function (ExactMatch to avoid loading sentence-transformers/files)
-    from recrl.rewards import ExactMatchReward
-    reward_engine = ExactMatchReward()
+    # Setup reward function
+    reward_engine = TextSemanticReward(
+        recif_path=recif_path,
+        device=device
+    )
 
     # Create sampler
     config = GRPOConfig(
         num_epochs=1,
-        per_device_batch_size=2, # Must divide train_dataset len * num_generations
-        gradient_accumulation_steps=1,
+        per_device_batch_size=4,
+        gradient_accumulation_steps=2,
         learning_rate=1e-6,
-        num_generations=2, # Small generation for quick test
+        num_generations=16,
         temperature=0.7,
-        max_completion_length=10,
+        max_completion_length=128,
         beta=0.04,
         output_dir=output_dir,
         device=device

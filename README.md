@@ -1,78 +1,136 @@
-# CleanOneRec
+# RecRL: Reinforcement Learning Framework for Recommendation LLMs
 
-A clean, modular, and highly extensible framework for LLM-based Recommendation, designed as a modern replacement for `MiniOneRec`. 
+A clean, modular, and highly extensible framework for training Large Language Models (LLMs) for recommendation tasks using Reinforcement Learning. Inspired by Volcano Engine's VERL, **RecRL** provides an elegant architecture that completely decouples data, rollout, rewards, and training logic.
 
-Instead of treating SFT, RL, and Evaluation as tangled scripts, `CleanOneRec` separates concerns into robust components (Data, Reward, Trainer, Evaluator), making it easy to experiment with new algorithms like **GRPO**, **EEPO**, and **DPO** without fighting the codebase.
+*Read this in [中文](README_zh.md).*
 
-## 🏗️ Architecture
+## ✨ Key Features
 
-```
-CleanOneRec/
-├── onerec/                         # Core Library
-│   ├── data/                       # Unified Dataset Builders
-│   │   └── builder.py              # Supports OpenOneRec-RecIF & Legacy CSV
-│   ├── trainer/                    # Training Engines
-│   │   └── eepo_trainer.py         # Advanced GRPO/EEPO Trainer
-│   ├── reward/                     # Reward Modeling
-│   │   ├── rule.py                 # Exact Match & NDCG rules
-│   │   ├── semantic.py             # Sentence-Transformer text similarity
-│   │   └── composite.py            # Combines semantic + novelty + penalties
-│   ├── eval/                       # Evaluation & Metrics
-│   │   └── evaluator.py            # HitRate & NDCG calculators
-│   └── utils/                      # Utilities
-│       ├── sid_helper.py           # SID parsing & hashing
-│       └── logit_processor.py      # Trie-based Constrained Decoding
-├── scripts/                        # Executable Entry Points
-│   ├── train_sft.py                # Supervised Fine-Tuning (SFT) with LoRA
-│   ├── train_rl.py                 # Reinforcement Learning (GRPO/EEPO)
-│   └── evaluate.py                 # Inference & Generation with Constraints
-└── run_experiment.sh               # Easy Bash Wrapper
-```
+- **Modular "Engine" Design**: Clean separation of `DataEngine`, `RolloutEngine`, `RewardEngine`, and `TrainerEngine`.
+- **Multiple Algorithms**: Native support for **GRPO** (Group Relative Policy Optimization) and **EEPO** (Explore-and-Evaluate Policy Optimization with fast-weight unlearning).
+- **Composable Rewards**: Easily combine multiple reward functions (e.g., Semantic Similarity, Exact Match, NDCG) with custom weights like building blocks.
+- **Constrained Decoding**: Built-in Trie-based `ConstrainedLogitsProcessor` ensures the LLM generates strictly valid Item IDs (SIDs), eliminating "hallucinated" recommendations and reward collapse.
+- **Extensible API**: Implement new algorithms (like DPO or PPO) in under 100 lines of code without touching the core generation loop.
 
-## 🚀 Key Improvements over MiniOneRec
+## 📦 Installation
 
-1. **Decoupled Trainers**: No more massive `minionerec_trainer.py` with infinite `if/else` branches. We use clean inheritance from TRL (e.g., `SFTTrainer`, `GRPOTrainer`).
-2. **Robust Constrained Decoding**: Replaced the brittle array-based `ConstrainedLogitsProcessor` with a robust Prefix Tree (`SIDTrie`). This strictly enforces that the LLM *cannot* hallucinate invalid SIDs during inference and RL sampling.
-3. **Unified Data Loading**: `DatasetBuilder` provides a single entry point for parsing both new `OpenOneRec-RecIF` (parquet/json) and old `Amazon` (csv) datasets.
-4. **Pluggable Rewards**: Reward functions are now proper Python classes, making it trivial to chain them (e.g., `CompositeReward = Semantic + TailBonus + InvalidPenalty`).
+RecRL requires Python 3.8+ and PyTorch 2.0+. 
 
-## 🛠️ Usage Guide
-
-### 1. Supervised Fine-Tuning (SFT)
-Train the base recommendation model using LoRA:
 ```bash
-python scripts/train_sft.py \
-    --model_path "/path/to/base/model" \
-    --train_file "/path/to/train.parquet" \
-    --output_dir "./outputs/sft" \
-    --use_lora True
+# Clone the repository
+git clone https://github.com/yourusername/RecRL.git
+cd RecRL
+
+# Install in editable mode
+pip install -e .
 ```
 
-### 2. Reinforcement Learning (GRPO / EEPO)
-Align the model using Group Relative Policy Optimization or Fast-Weight EEPO. The Trie-based constraint ensures you don't get stuck at `-10` invalid penalty!
-```bash
-python scripts/train_rl.py \
-    --model_path "./outputs/sft/final_checkpoint" \
-    --train_file "/path/to/train.parquet" \
-    --recif_path "/path/to/OpenOneRec-RecIF" \
-    --output_dir "./outputs/rl" \
-    --constrained_decoding True \
-    --eepo_enabled True
+## 🚀 Quick Start
+
+### 1. Standard GRPO Training
+
+```python
+from recrl.core import DataEngine, RolloutEngine
+from recrl.algorithms.grpo import GRPOTrainer, GRPOConfig
+from recrl.rewards import TextSemanticReward
+from recrl.data import RepeatRandomSampler
+
+# Load your recommendation dataset
+train_dataset = DataEngine.from_parquet("data/train.parquet", format="recif")
+
+# Setup core engines
+rollout_engine = RolloutEngine(tokenizer, device="cuda")
+reward_engine = TextSemanticReward(recif_path="data/recif_metadata")
+
+# Configure training and sampler
+config = GRPOConfig(num_generations=16, temperature=0.7)
+sampler = RepeatRandomSampler(train_dataset, repeat_count=16)
+
+# Initialize trainer and start
+trainer = GRPOTrainer(
+    model=model,
+    ref_model=ref_model,
+    config=config,
+    train_dataset=train_dataset,
+    rollout_engine=rollout_engine,
+    reward_engine=reward_engine,
+    tokenizer=tokenizer,
+    sampler=sampler
+)
+trainer.train()
 ```
 
-### 3. Evaluation & Inference
-Generate predictions using Beam Search with Constrained Decoding, and compute HitRate (HR) & NDCG:
-```bash
-python scripts/evaluate.py \
-    --model_path "./outputs/rl/final_checkpoint" \
-    --test_file "/path/to/test.parquet" \
-    --recif_path "/path/to/OpenOneRec-RecIF" \
-    --beam_size 20 \
-    --constrained_decoding True
+### 2. Fast-Weight EEPO Training
+
+EEPO performs in-place `lm_head` fast-weight updates during generation to encourage exploratory recommendations and break student-teacher exposure bias.
+
+```python
+from recrl.algorithms.eepo import EEPOTrainer, EEPOConfig
+
+config = EEPOConfig(
+    num_generations=16,
+    eepo_enabled=True,
+    eepo_stage1_ratio=0.5,  # 50% exploitation, 50% exploration
+    eepo_unlearn_lr=1e-5,
+    add_gt=True
+)
+
+trainer = EEPOTrainer(
+    model=model,
+    config=config,
+    train_dataset=train_dataset,
+    rollout_engine=rollout_engine,
+    reward_engine=reward_engine,
+    tokenizer=tokenizer,
+    sampler=sampler
+)
+trainer.train()
 ```
 
-## 🔧 Installation
-Ensure you have PyTorch, Transformers, TRL, PEFT, and Pandas installed:
-```bash
-pip install torch transformers trl peft datasets pandas pyarrow sentence-transformers fire
+### 3. Combining Multiple Rewards
+
+Easily balance relevance, novelty, and exact-match constraints using the `CompositeReward` system:
+
+```python
+from recrl.core import CompositeReward
+from recrl.rewards import TextSemanticReward, ExactMatchReward
+
+reward_engine = CompositeReward([
+    (TextSemanticReward(recif_path="data/"), 0.8),  # 80% weight on Semantic Similarity
+    (ExactMatchReward(), 0.2)                       # 20% weight on Exact ID Match
+])
 ```
+
+## 🏗 Architecture
+
+RecRL breaks away from monolithic trainer scripts by adopting a decoupled, Engine-based approach:
+
+```text
+recrl/
+├── core/                       # Core abstractions
+│   ├── base_trainer.py         # BaseRLTrainer loop
+│   ├── rollout.py              # Generation & logprobs (RolloutEngine)
+│   ├── reward.py               # Reward interfaces (CompositeReward)
+│   └── data.py                 # Data parser (DataEngine)
+├── algorithms/                 # RL implementations
+│   ├── grpo/                   # Standard GRPO
+│   └── eepo/                   # EEPO (Unlearn mechanism)
+├── rewards/                    # Pluggable reward modules
+│   ├── semantic.py             # Sentence-Transformer text similarity
+│   └── rule.py                 # Exact Match / NDCG
+├── constraints/                # Valid ID enforcement
+│   ├── trie.py                 # Prefix Tree for Valid SIDs
+│   └── processor.py            # NaN-safe ConstrainedLogitsProcessor
+└── examples/                   # Ready-to-run training scripts
+```
+
+## 🤝 Contributing
+
+We welcome contributions! To add a new algorithm (e.g., DPO):
+1. Create a new folder under `recrl/algorithms/dpo/`.
+2. Inherit from `BaseRLTrainer` and override the `compute_loss()` function.
+3. Your algorithm will automatically inherit constrained decoding, reward composition, and dataset handling.
+
+## 📄 License
+
+This project is licensed under the Apache 2.0 License.
