@@ -50,7 +50,7 @@ def parse_args():
     p.add_argument("--num-generations", type=int, default=None, dest="num_generations")
     p.add_argument("--samples", type=int, default=-1, help="Subset size (-1 = all)")
     p.add_argument("--report-to", type=str, default="none",
-                   choices=["none", "wandb", "tensorboard"], dest="report_to")
+                   choices=["none", "swanlab", "tensorboard"], dest="report_to")
     p.add_argument("--run-name", type=str, default=None, dest="run_name")
     p.add_argument("--constrained", action="store_true",
                    help="Enable SID trie constrained decoding (slower but always valid)")

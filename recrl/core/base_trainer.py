@@ -7,7 +7,7 @@ algorithm-specific logic to subclasses.
 
 Features:
 - Multi-GPU via Accelerate (automatic DDP / FSDP)
-- wandb + tensorboard logging
+- swanlab + tensorboard logging
 - Rich tqdm progress bar with live reward/loss stats
 - Gradient accumulation, clipping, LR scheduling
 """
@@ -60,8 +60,8 @@ class RLConfig:
     logging_steps: int = 1
     save_steps: int = 100
     output_dir: str = "./outputs"
-    report_to: str = "none"          # "wandb" | "tensorboard" | "none"
-    run_name: Optional[str] = None   # wandb run name
+    report_to: str = "none"          # "swanlab" | "tensorboard" | "none"
+    run_name: Optional[str] = None   # swanlab run name
 
     # Device / distributed
     device: str = "cuda"
@@ -104,7 +104,6 @@ class BaseRLTrainer(ABC):
             from accelerate import Accelerator
             self.accelerator = Accelerator(
                 gradient_accumulation_steps=config.gradient_accumulation_steps,
-                log_with=config.report_to if config.report_to != "none" else None,
             )
             self._use_accelerate = True
         except ImportError:
@@ -155,7 +154,23 @@ class BaseRLTrainer(ABC):
                 self.model, self.optimizer, self.scheduler
             )
 
-        # ── Logging backends ──────────────────────────────────────────────
+        # ── SwanLab logging ───────────────────────────────────────────────
+        self._swanlab = None
+        if config.report_to == "swanlab":
+            try:
+                import swanlab
+                is_main = (not self._use_accelerate) or self.accelerator.is_main_process
+                if is_main:
+                    self._swanlab = swanlab.init(
+                        project="CleanOneRec",
+                        experiment_name=config.run_name or "run",
+                        config=vars(config),
+                    )
+                    logger.info(f"SwanLab logging enabled (experiment: {config.run_name or 'run'})")
+            except ImportError:
+                logger.warning("swanlab not installed — pip install swanlab")
+
+        # ── TensorBoard logging ───────────────────────────────────────────
         self._tb_writer = None
         if config.report_to == "tensorboard":
             try:
@@ -165,13 +180,6 @@ class BaseRLTrainer(ABC):
                 logger.info(f"TensorBoard logging → {log_dir}")
             except ImportError:
                 logger.warning("tensorboard not installed, skipping TB logging")
-
-        if config.report_to == "wandb" and self._use_accelerate:
-            self.accelerator.init_trackers(
-                project_name="CleanOneRec",
-                config=vars(config),
-                init_kwargs={"wandb": {"name": config.run_name}},
-            )
 
         is_main = (not self._use_accelerate) or self.accelerator.is_main_process
         if is_main:
@@ -237,8 +245,8 @@ class BaseRLTrainer(ABC):
             logger.info(f"Training done in {elapsed/60:.1f} min")
             self._save_checkpoint(final=True)
 
-        if self._use_accelerate and self.config.report_to == "wandb":
-            self.accelerator.end_training()
+        if self._swanlab is not None:
+            self._swanlab.finish()
 
     # ─────────────────────────────────────────────────────────────────────
     # Internal
@@ -375,9 +383,10 @@ class BaseRLTrainer(ABC):
             for k, v in metrics.items():
                 self._tb_writer.add_scalar(f"train/{k}", v, step)
 
-        # wandb (via accelerate tracker)
-        if self._use_accelerate and self.config.report_to == "wandb":
-            self.accelerator.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
+        # SwanLab
+        if self._swanlab is not None:
+            import swanlab
+            swanlab.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
 
     def _save_checkpoint(self, final: bool = False):
         """Save model + tokenizer checkpoint (only on main process)."""
