@@ -18,7 +18,7 @@ RecRL 是一个干净、模块化且高度可扩展的强化学习（RL）框架
 
 ```bash
 # 克隆仓库
-git clone https://github.com/yourusername/RecRL.git
+https://github.com/zzr9468-sys/CleanOneRec.git
 cd RecRL
 
 # 使用可编辑模式安装
