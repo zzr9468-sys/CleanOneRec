@@ -142,6 +142,8 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH, dtype=dtype, trust_remote_code=True,
     )
+    model.gradient_checkpointing_enable()  # Save GPU memory at cost of ~20% slower training
+
     ref_model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH, dtype=dtype, trust_remote_code=True,
     )

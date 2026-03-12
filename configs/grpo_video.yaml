@@ -7,17 +7,18 @@ model_path:  /data/zhouziren/ms/OneRec-1.7B
 data_path:   /data/zhouziren/ms/OpenOneRec-RecIF/benchmark_data/video/video_test.parquet
 recif_path:  /data/zhouziren/ms/OpenOneRec-RecIF
 algo:        grpo
+device:      cuda:0   # physical GPU selected via CUDA_VISIBLE_DEVICES
 
 # Training
 num_epochs:                1
-per_device_batch_size:     4
-gradient_accumulation_steps: 2
+per_device_batch_size:     2
+gradient_accumulation_steps: 4
 learning_rate:             1.0e-6
 warmup_steps:              10
 max_grad_norm:             1.0
 
 # Generation
-num_generations:           8
+num_generations:           4
 max_completion_length:     128
 temperature:               0.7
 

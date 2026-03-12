@@ -126,8 +126,9 @@ class BaseRLTrainer(ABC):
         if not self._use_accelerate:
             self.model.to(self.device)
         if self.ref_model is not None:
-            # ref_model stays on same device as model; never wrapped by accelerate
-            self.ref_model.to(self.device)
+            # ref_model is kept on CPU to save GPU memory.
+            # It is temporarily moved to GPU only during ref logprob computation.
+            self.ref_model.to("cpu")
             self.ref_model.eval()
             for p in self.ref_model.parameters():
                 p.requires_grad_(False)
@@ -303,6 +304,11 @@ class BaseRLTrainer(ABC):
             self.accelerator.unwrap_model(self.model)
             if self._use_accelerate else self.model
         )
+        # Disable gradient checkpointing during generation (need KV cache for quality)
+        grad_ckpt_was_enabled = gen_model.is_gradient_checkpointing
+        if grad_ckpt_was_enabled:
+            gen_model.gradient_checkpointing_disable()
+
         prompt_ids, completion_ids, completion_mask = self.rollout_engine.generate(
             prompts=prompts,
             model=gen_model,
@@ -310,6 +316,10 @@ class BaseRLTrainer(ABC):
             temperature=self.config.temperature,
             num_return_sequences=self.config.num_generations,
         )
+
+        # Re-enable gradient checkpointing for training
+        if grad_ckpt_was_enabled:
+            gen_model.gradient_checkpointing_enable()
 
         completions = self.rollout_engine.decode_completions(completion_ids)
 
@@ -347,14 +357,23 @@ class BaseRLTrainer(ABC):
 
         # ── Reference log-probs ───────────────────────────────────────────
         prompt_mask = (prompt_ids != self.tokenizer.pad_token_id).int()
-        ref_model   = self.ref_model if self.ref_model is not None else gen_model
+        if self.ref_model is not None:
+            # Temporarily move ref_model to GPU for inference, then back to CPU
+            self.ref_model.to(self.device)
+            ref_model_for_logp = self.ref_model
+        else:
+            ref_model_for_logp = gen_model
         ref_per_token_logps = self.rollout_engine.compute_ref_logprobs(
             prompt_ids=prompt_ids,
             completion_ids=completion_ids,
             prompt_mask=prompt_mask,
             completion_mask=completion_mask,
-            ref_model=ref_model,
+            ref_model=ref_model_for_logp,
         )
+        if self.ref_model is not None:
+            # Move ref_model back to CPU to free GPU memory
+            self.ref_model.to("cpu")
+            torch.cuda.empty_cache()
         ref_per_token_logps = ref_per_token_logps.to(self.device)
 
         return {

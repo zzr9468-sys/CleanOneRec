@@ -70,6 +70,11 @@ class EEPOTrainer(BaseRLTrainer):
         g1 = max(1, int(self.config.num_generations * self.config.eepo_stage1_ratio))
         g2 = self.config.num_generations - g1
 
+        # Disable gradient checkpointing during generation
+        grad_ckpt_was_enabled = self.model.is_gradient_checkpointing
+        if grad_ckpt_was_enabled:
+            self.model.gradient_checkpointing_disable()
+
         # Stage 1: Exploitation
         _, completion_ids_1, _ = self.rollout_engine.generate(
             prompts=unique_prompts,
@@ -121,6 +126,10 @@ class EEPOTrainer(BaseRLTrainer):
             )
         else:
             completion_ids = completion_ids_1
+
+        # Re-enable gradient checkpointing for training
+        if grad_ckpt_was_enabled:
+            self.model.gradient_checkpointing_enable()
 
         # Stage 4: Restore original weights
         self.unlearner.restore_weights(lm_head, original_weights)
@@ -179,14 +188,22 @@ class EEPOTrainer(BaseRLTrainer):
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.config.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
 
-        # Compute reference log probabilities
+        # Compute reference log probabilities (ref_model offloaded to CPU)
+        if self.ref_model is not None:
+            self.ref_model.to(self.device)
+            ref_model_for_logp = self.ref_model
+        else:
+            ref_model_for_logp = self.model
         ref_per_token_logps = self.rollout_engine.compute_ref_logprobs(
             prompt_ids=prompt_ids,
             completion_ids=completion_ids,
             prompt_mask=prompt_mask,
             completion_mask=completion_mask,
-            ref_model=self.ref_model if self.ref_model is not None else self.model
+            ref_model=ref_model_for_logp
         )
+        if self.ref_model is not None:
+            self.ref_model.to("cpu")
+            torch.cuda.empty_cache()
 
         return {
             "prompt_ids": prompt_ids,
