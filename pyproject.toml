@@ -1,18 +1,30 @@
 [project]
 name = "cleanonerec"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.2.0"
+description = "Reinforcement learning framework for generative recommendation with OpenOneRec"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "accelerate>=1.0.0",
     "datasets>=4.6.1",
     "fire>=0.7.1",
     "pandas>=3.0.1",
     "peft>=0.18.1",
     "pyarrow>=23.0.1",
     "pytest>=9.0.2",
+    "pyyaml>=6.0",
     "sentence-transformers>=5.2.3",
     "torch>=2.10.0",
     "transformers>=5.3.0",
     "trl>=0.29.0",
+    "wandb>=0.18.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+cleanonerec-train = "train:main"

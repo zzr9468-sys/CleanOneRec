@@ -1,77 +1,95 @@
 """
-RecRL 组合 Reward
+RecRL Composite Reward
 
-组合多个 reward 函数：
-1. Longview 隐式反馈 (50%) - 主要信号
-2. 语义相似度 (30%) - 辅助信号
-3. 新颖性 (15%) - 探索长尾
-4. 多样性 (5%) - 避免重复
+Combines four reward signals:
+    1. Longview implicit feedback  (50%) — main signal, user true interest
+    2. Semantic similarity         (30%) — generated item vs target item
+    3. Novelty                     (15%) — encourage long-tail exploration
+    4. Diversity                   ( 5%) — avoid mode collapse within group
+
+All four are fully implemented. Weights are configurable.
 """
 
+import logging
 from typing import List, Dict, Optional
+
 from .longview_reward import LongviewBasedReward
 from .novelty_reward import NoveltyReward
+from .semantic import TextSemanticReward
+from .diversity_reward import DiversityReward
+
+logger = logging.getLogger(__name__)
 
 
 class RecRLCompositeReward:
     """
-    RecRL 推荐的组合 Reward
+    Composite reward for generative recommendation RL training.
 
-    核心思想：
-    - 用 Longview 作为主要信号（用户真实兴趣）
-    - 语义相似度作为辅助（内容匹配）
-    - 新颖性鼓励探索长尾
-    - 多样性避免重复推荐
+    Design rationale:
+    - Longview (50%): strongest unbiased signal — user actively watched
+    - Semantic (30%): content relevance to ground-truth target
+    - Novelty (15%): pushes model toward long-tail, underexposed items
+    - Diversity (5%): prevents all G generations collapsing to the same item
     """
+
+    DEFAULT_WEIGHTS = {
+        'longview':  0.50,
+        'semantic':  0.30,
+        'novelty':   0.15,
+        'diversity': 0.05,
+    }
 
     def __init__(
         self,
         recif_path: str,
         device: str = "cuda",
-        weights: Optional[Dict[str, float]] = None
+        weights: Optional[Dict[str, float]] = None,
+        num_generations: int = 4,
+        semantic_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        longview_model: str = "sentence-transformers/all-MiniLM-L6-v2",
     ):
         """
-        参数:
-            recif_path: RecIF 数据路径
-            device: 设备 (cuda/cpu)
-            weights: 权重字典，默认为:
-                {
-                    'longview': 0.5,
-                    'semantic': 0.3,
-                    'novelty': 0.15,
-                    'diversity': 0.05
-                }
+        Args:
+            recif_path:        Path to OpenOneRec-RecIF data directory
+            device:            torch device string ("cuda", "cpu", "cuda:1", ...)
+            weights:           Override default component weights (must sum to 1)
+            num_generations:   G — number of completions per prompt (for diversity)
+            semantic_model:    Sentence-transformer model for semantic reward
+            longview_model:    Sentence-transformer model for longview reward
         """
         self.recif_path = recif_path
         self.device = device
+        self.weights = weights or self.DEFAULT_WEIGHTS
+        self.num_generations = num_generations
 
-        # 默认权重
-        if weights is None:
-            weights = {
-                'longview': 0.5,
-                'semantic': 0.3,
-                'novelty': 0.15,
-                'diversity': 0.05
-            }
-        self.weights = weights
+        total = sum(self.weights.values())
+        if abs(total - 1.0) > 1e-3:
+            logger.warning(f"Reward weights sum to {total:.3f}, expected 1.0")
 
-        # 初始化各个 reward 函数
-        print("🚀 初始化 RecRL Composite Reward...")
+        logger.info("Initializing RecRL Composite Reward...")
+        logger.info(f"   weights: {self.weights}")
 
-        # 1. Longview 隐式反馈
-        self.longview_reward = LongviewBasedReward(recif_path, device=device)
+        # 1. Longview
+        self.longview_reward = LongviewBasedReward(
+            recif_path,
+            model_name=longview_model,
+            device=device,
+        )
 
-        # 2. 语义相似度（复用 Longview 的逻辑，但针对 target）
-        # TODO: 实现专门的 semantic reward
+        # 2. Semantic
+        self.semantic_reward = TextSemanticReward(
+            recif_path,
+            device=device,
+            model_name=semantic_model,
+        )
 
-        # 3. 新颖性
+        # 3. Novelty
         self.novelty_reward = NoveltyReward(recif_path)
 
-        # 4. 多样性
-        # TODO: 实现 diversity reward
+        # 4. Diversity
+        self.diversity_reward = DiversityReward(num_generations=num_generations)
 
-        print(f"✅ RecRL Composite Reward 初始化完成")
-        print(f"   权重: {self.weights}")
+        logger.info("RecRL Composite Reward ready")
 
     def __call__(
         self,
@@ -82,51 +100,70 @@ class RecRLCompositeReward:
         **kwargs
     ) -> List[float]:
         """
-        计算组合 Reward
+        Compute composite reward for a batch of completions.
 
-        参数:
-            prompts: 输入 prompts
-            completions: 生成的 SID 列表
-            longview_history: 每个样本的 longview 历史
-            target_pids: 每个样本的目标 PID 列表
+        Args:
+            prompts:          Input prompts  (len = B * G)
+            completions:      Generated SIDs (len = B * G)
+            longview_history: Per-sample longview PID lists (len = B * G)
+            target_pids:      Ground-truth PID lists (passed through)
+            **kwargs:         Passed to sub-rewards (e.g. target_sid for semantic)
 
-        返回:
-            rewards: 每个样本的组合 reward
+        Returns:
+            Composite reward scores (len = B * G)
         """
-        # 1. Longview 隐式反馈
-        longview_rewards = self.longview_reward(
-            prompts, completions, longview_history=longview_history
+        n = len(completions)
+        w = self.weights
+
+        lv_rewards = (
+            self.longview_reward(prompts, completions, longview_history=longview_history)
+            if w.get('longview', 0) > 0 else [0.0] * n
         )
 
-        # 2. 新颖性
-        novelty_rewards = self.novelty_reward(prompts, completions)
+        sem_rewards = (
+            self.semantic_reward(prompts, completions, **kwargs)
+            if w.get('semantic', 0) > 0 else [0.0] * n
+        )
 
-        # 3. 组合
-        final_rewards = []
-        for i in range(len(completions)):
-            lv_r = longview_rewards[i]
-            nov_r = novelty_rewards[i]
+        nov_rewards = (
+            self.novelty_reward(prompts, completions)
+            if w.get('novelty', 0) > 0 else [0.0] * n
+        )
 
-            # 加权组合
-            final_r = (
-                self.weights['longview'] * lv_r +
-                self.weights['novelty'] * nov_r
+        div_rewards = (
+            self.diversity_reward(prompts, completions)
+            if w.get('diversity', 0) > 0 else [0.0] * n
+        )
+
+        final_rewards = [
+            w.get('longview',  0) * lv_rewards[i]  +
+            w.get('semantic',  0) * sem_rewards[i]  +
+            w.get('novelty',   0) * nov_rewards[i]  +
+            w.get('diversity', 0) * div_rewards[i]
+            for i in range(n)
+        ]
+
+        # Log component means on first call
+        if not hasattr(self, '_logged_once'):
+            self._logged_once = True
+            logger.info(
+                f"[Reward breakdown]  "
+                f"lv={sum(lv_rewards)/n:.3f}  "
+                f"sem={sum(sem_rewards)/n:.3f}  "
+                f"nov={sum(nov_rewards)/n:.3f}  "
+                f"div={sum(div_rewards)/n:.3f}  "
+                f"total={sum(final_rewards)/n:.3f}"
             )
-
-            final_rewards.append(final_r)
 
         return final_rewards
 
 
 if __name__ == "__main__":
-    # 测试
+    import logging
+    logging.basicConfig(level=logging.INFO)
     reward = RecRLCompositeReward("/Users/zhouziren/onerec/OpenOneRec-RecIF")
-
-    # 测试数据
-    prompts = ["用户历史..."]
-    completions = ["<s_a_0><s_b_0><s_c_1>"]
-    longview_history = [[2360735, 9241153, 11239440]]
-
-    # 计算 reward
+    prompts = ["user history..."] * 4
+    completions = ["<|sid_begin|><s_a_0><s_b_0><s_c_1><|sid_end|>"] * 4
+    longview_history = [[2360735, 9241153, 11239440]] * 4
     rewards = reward(prompts, completions, longview_history=longview_history)
     print(f"Composite Rewards: {rewards}")

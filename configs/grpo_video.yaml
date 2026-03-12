@@ -1,0 +1,36 @@
+# GRPO training config for video recommendation
+# Usage:
+#   Single GPU:  python train.py --config configs/grpo_video.yaml
+#   Multi-GPU:   accelerate launch --num_processes 4 train.py --config configs/grpo_video.yaml
+
+model_path:  /data/zhouziren/ms/OneRec-1.7B
+data_path:   /data/zhouziren/ms/OpenOneRec-RecIF/benchmark_data/video/video_test.parquet
+recif_path:  /data/zhouziren/ms/OpenOneRec-RecIF
+algo:        grpo
+
+# Training
+num_epochs:                1
+per_device_batch_size:     4
+gradient_accumulation_steps: 2
+learning_rate:             1.0e-6
+warmup_steps:              10
+max_grad_norm:             1.0
+
+# Generation
+num_generations:           8
+max_completion_length:     128
+temperature:               0.7
+
+# RL
+beta: 0.04
+
+# Reward weights (must sum to 1.0)
+reward_weights:
+  longview:  0.50
+  semantic:  0.30
+  novelty:   0.15
+  diversity: 0.05
+
+# Logging
+logging_steps: 1
+save_steps:    200

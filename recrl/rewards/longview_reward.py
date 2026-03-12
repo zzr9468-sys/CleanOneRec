@@ -1,125 +1,96 @@
 """
-基于 Longview 的隐式反馈 Reward
+Longview-based Implicit Feedback Reward
 
-核心思想：
-- Longview（长时观看）是用户真实兴趣的最强信号
-- 不受曝光偏差影响（用户主动选择观看）
-- 如果推荐的物品与用户 longview 历史语义相似，给高分
+Core idea:
+- Longview (long-watch) is the strongest signal of true user interest
+- Not subject to exposure bias (user actively chose to watch)
+- Reward generated items that are semantically similar to user's longview history
 """
 
+import re
 import torch
 import json
 import pandas as pd
-import re
 from typing import List, Dict, Optional
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 
+SID_PATTERN = re.compile(r'<\|sid_begin\|>.*?<\|sid_end\|>')
+
 
 class LongviewBasedReward:
     """
-    基于 Longview 的隐式反馈 Reward
+    Longview-based implicit feedback reward.
 
-    计算逻辑：
-    1. 解析生成的 SID -> PID -> Caption
-    2. 获取用户 longview 历史的 Captions
-    3. 计算语义相似度
-    4. 返回最大相似度作为 reward
+    Steps:
+    1. Parse generated SID -> PID -> Caption
+    2. Get user longview history captions
+    3. Compute max cosine similarity between generated and history
+    4. Return max similarity as reward
+
+    Performance: all encoding is batched across the full call in one
+    sentence-transformer forward pass.
     """
 
     def __init__(
         self,
         recif_path: str,
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
-        device: str = "cuda"
+        device: str = "cuda",
+        validity_penalty: float = -1.0,
+        encode_batch_size: int = 256,
     ):
         self.recif_path = Path(recif_path)
         self.device = device
+        self.validity_penalty = validity_penalty
+        self.encode_batch_size = encode_batch_size
 
-        # 加载映射
         self.sid2pid_dict = self._load_sid2pid()
         self.pid2caption_dict = self._load_pid2caption()
-
-        # 加载文本模型
         self.text_model = SentenceTransformer(model_name, device=device)
 
-        print(f"✅ LongviewBasedReward 初始化完成")
-        print(f"   - SID->PID 映射: {len(self.sid2pid_dict)} 条")
-        print(f"   - PID->Caption 映射: {len(self.pid2caption_dict)} 条")
-        print(f"   - 文本模型: {model_name}")
+        print(f"✅ LongviewBasedReward initialized")
+        print(f"   SID->PID mappings : {len(self.sid2pid_dict):,}")
+        print(f"   PID->Caption entries: {len(self.pid2caption_dict):,}")
+        print(f"   Encoder           : {model_name}")
 
     def _load_sid2pid(self) -> Dict[str, List[Dict]]:
-        """加载 SID -> PID 映射"""
         sid2pid_path = self.recif_path / "benchmark_data" / "sid2pid.json"
         with open(sid2pid_path, 'r') as f:
             return json.load(f)
 
     def _load_pid2caption(self) -> Dict[str, str]:
-        """加载 PID -> Caption 映射"""
         pid2caption_path = self.recif_path / "pid2caption.parquet"
         df = pd.read_parquet(pid2caption_path)
-
-        pid2caption = {}
-        for _, row in df.iterrows():
-            pid = str(row['pid'])
-            caption = row['dense_caption']  # 注意：列名是 dense_caption
-            pid2caption[pid] = caption
-
-        return pid2caption
+        return dict(zip(df['pid'].astype(str), df['dense_caption']))
 
     def _parse_sid_to_hash_key(self, sid_str: str) -> Optional[str]:
-        """
-        将 <s_a_X><s_b_Y><s_c_Z> 转换为 hash key
-
-        公式: hash_key = a * 8192 * 8192 + b * 8192 + c
-        """
+        """<s_a_X><s_b_Y><s_c_Z> -> hash key string."""
         matches = re.findall(r'<s_[abc]_(\d+)>', sid_str)
         if len(matches) == 3:
             a, b, c = int(matches[0]), int(matches[1]), int(matches[2])
-            hash_key = str(a * 8192 * 8192 + b * 8192 + c)
-            return hash_key
+            return str(a * 8192 * 8192 + b * 8192 + c)
         return None
 
     def _get_caption_from_sid(self, sid_str: str) -> Optional[str]:
-        """
-        从 SID 获取 Caption
-
-        流程: SID -> Hash Key -> PID -> Caption
-        """
-        # 1. SID -> Hash Key
+        """SID string -> caption text (via hash key -> PID -> caption)."""
         hash_key = self._parse_sid_to_hash_key(sid_str)
-        if hash_key is None:
+        if hash_key is None or hash_key not in self.sid2pid_dict:
             return None
-
-        # 2. Hash Key -> PID
-        if hash_key not in self.sid2pid_dict:
-            return None
-
         pid_list = self.sid2pid_dict[hash_key]
-        if len(pid_list) == 0:
+        if not pid_list:
             return None
-
-        # 取第一个 PID（通常是最常见的）
         pid = str(pid_list[0]['pid'])
+        return self.pid2caption_dict.get(pid)
 
-        # 3. PID -> Caption
-        if pid not in self.pid2caption_dict:
-            return None
-
-        return self.pid2caption_dict[pid]
-
-    def _compute_similarity(self, text1: str, text2: str) -> float:
-        """计算两个文本的语义相似度"""
-        emb1 = self.text_model.encode(text1, convert_to_tensor=True)
-        emb2 = self.text_model.encode(text2, convert_to_tensor=True)
-
-        # 余弦相似度
-        sim = torch.nn.functional.cosine_similarity(
-            emb1.unsqueeze(0),
-            emb2.unsqueeze(0)
-        ).item()
-
-        return sim
+    def _get_longview_captions(self, hist_pids: List[int]) -> List[str]:
+        """Get captions for a list of longview PIDs."""
+        captions = []
+        for pid in hist_pids:
+            cap = self.pid2caption_dict.get(str(int(pid)))
+            if cap:
+                captions.append(cap)
+        return captions
 
     def __call__(
         self,
@@ -129,85 +100,88 @@ class LongviewBasedReward:
         **kwargs
     ) -> List[float]:
         """
-        计算 Reward
+        Compute rewards for a batch of completions.
 
-        参数:
-            prompts: 输入 prompts
-            completions: 生成的 SID 列表
-            longview_history: 每个样本的 longview 历史 PID 列表
-
-        返回:
-            rewards: 每个样本的 reward
+        All sentence-transformer encoding is done in one batched call.
         """
         if longview_history is None:
-            # 如果没有提供 longview 历史，返回 0
             return [0.0] * len(completions)
 
-        rewards = []
+        # ── Step 1: resolve captions for each completion ──────────────────
+        gen_captions: List[Optional[str]] = []
+        hist_captions_per_sample: List[List[str]] = []
+        valid: List[bool] = []
 
         for i, completion in enumerate(completions):
-            # 获取该样本的 longview 历史
             hist_pids = longview_history[i] if i < len(longview_history) else []
+            hist_caps = self._get_longview_captions(hist_pids)
 
-            if len(hist_pids) == 0:
-                rewards.append(0.0)
-                continue
+            sids = SID_PATTERN.findall(completion)
+            gen_cap = self._get_caption_from_sid(sids[0]) if sids else None
 
-            # 获取 longview 物品的 captions
-            longview_captions = []
-            for pid in hist_pids:
-                pid_str = str(int(pid))
-                if pid_str in self.pid2caption_dict:
-                    longview_captions.append(self.pid2caption_dict[pid_str])
-
-            if len(longview_captions) == 0:
-                rewards.append(0.0)
-                continue
-
-            # 解析生成的 SID -> Caption
-            # 注意：completion 可能包含多个 SID，只取第一个
-            import re
-            sid_pattern = r'<\|sid_begin\|>.*?<\|sid_end\|>'
-            sids = re.findall(sid_pattern, completion)
-
-            if len(sids) == 0:
-                rewards.append(-10.0)
-                continue
-
-            first_sid = sids[0]
-            gen_caption = self._get_caption_from_sid(first_sid)
-
+            # Debug first sample on first call
             if i == 0 and not hasattr(self, '_debug_printed'):
                 self._debug_printed = True
-                print(f"[DEBUG Longview] First SID: {first_sid}")
-                print(f"[DEBUG Longview] Caption: {gen_caption[:100] if gen_caption else 'None'}")
-                print(f"[DEBUG Longview] Longview history size: {len(longview_captions)}")
+                first_sid = sids[0] if sids else "none"
+                print(f"[DEBUG Longview] first_sid : {first_sid}")
+                print(f"[DEBUG Longview] gen_caption: {(gen_cap or 'None')[:80]}")
+                print(f"[DEBUG Longview] hist_size  : {len(hist_caps)}")
 
-            if gen_caption is None:
-                # 无效的 SID，给予惩罚
-                rewards.append(-10.0)
+            gen_captions.append(gen_cap)
+            hist_captions_per_sample.append(hist_caps)
+            valid.append(gen_cap is not None and len(hist_caps) > 0)
+
+        if not any(valid):
+            return [self.validity_penalty] * len(completions)
+
+        # ── Step 2: build flat text list for ONE batched encode ───────────
+        # Layout: [gen_cap_i, hist_cap_i_0, hist_cap_i_1, ...] for valid i
+        flat_texts: List[str] = []
+        # Track slices: for each sample i, (gen_idx, hist_start, hist_end) in flat_texts
+        sample_slices: List[Optional[tuple]] = []
+
+        for i in range(len(completions)):
+            if not valid[i]:
+                sample_slices.append(None)
+                continue
+            gen_idx = len(flat_texts)
+            flat_texts.append(gen_captions[i])
+            hist_start = len(flat_texts)
+            flat_texts.extend(hist_captions_per_sample[i])
+            hist_end = len(flat_texts)
+            sample_slices.append((gen_idx, hist_start, hist_end))
+
+        # ── Step 3: encode all texts in one call ──────────────────────────
+        all_embs = self.text_model.encode(
+            flat_texts,
+            convert_to_tensor=True,
+            batch_size=self.encode_batch_size,
+            show_progress_bar=False,
+        )  # [N, D]
+
+        # ── Step 4: compute max cosine similarity per sample ──────────────
+        rewards: List[float] = []
+        for i in range(len(completions)):
+            if not valid[i]:
+                rewards.append(self.validity_penalty)
                 continue
 
-            # 计算与所有 longview 物品的最大相似度
-            max_sim = 0.0
-            for lv_caption in longview_captions:
-                sim = self._compute_similarity(gen_caption, lv_caption)
-                max_sim = max(max_sim, sim)
+            gen_idx, hist_start, hist_end = sample_slices[i]
+            gen_emb = all_embs[gen_idx]          # [D]
+            hist_embs = all_embs[hist_start:hist_end]  # [H, D]
 
-            rewards.append(max_sim)
+            sims = torch.nn.functional.cosine_similarity(
+                gen_emb.unsqueeze(0), hist_embs
+            )  # [H]
+            rewards.append(sims.max().item())
 
         return rewards
 
 
 if __name__ == "__main__":
-    # 测试
     reward = LongviewBasedReward("/Users/zhouziren/onerec/OpenOneRec-RecIF")
-
-    # 测试数据
-    prompts = ["用户历史..."]
-    completions = ["<s_a_0><s_b_0><s_c_1>"]
+    prompts = ["user history..."]
+    completions = ["<|sid_begin|><s_a_0><s_b_0><s_c_1><|sid_end|>"]
     longview_history = [[2360735, 9241153, 11239440]]
-
-    # 计算 reward
     rewards = reward(prompts, completions, longview_history=longview_history)
     print(f"Rewards: {rewards}")

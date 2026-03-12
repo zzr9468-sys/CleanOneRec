@@ -4,17 +4,26 @@ Base RL Trainer
 Abstract base class for all RL algorithms (GRPO, EEPO, DPO, etc.).
 Provides common training loop infrastructure while delegating
 algorithm-specific logic to subclasses.
+
+Features:
+- Multi-GPU via Accelerate (automatic DDP / FSDP)
+- wandb + tensorboard logging
+- Rich tqdm progress bar with live reward/loss stats
+- Gradient accumulation, clipping, LR scheduling
 """
 
+import os
+import time
 from abc import ABC, abstractmethod
-from typing import Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional, Dict, Any
+
 import torch
 from torch.utils.data import DataLoader, Sampler
 from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
-    get_scheduler
+    get_scheduler,
 )
 from datasets import Dataset
 from tqdm import tqdm
@@ -51,8 +60,10 @@ class RLConfig:
     logging_steps: int = 1
     save_steps: int = 100
     output_dir: str = "./outputs"
+    report_to: str = "none"          # "wandb" | "tensorboard" | "none"
+    run_name: Optional[str] = None   # wandb run name
 
-    # Device
+    # Device / distributed
     device: str = "cuda"
     seed: int = 42
 
@@ -61,8 +72,11 @@ class BaseRLTrainer(ABC):
     """
     Base trainer for RL algorithms.
 
+    Supports single-GPU, multi-GPU (via Accelerate), and CPU training.
+    Pass ACCELERATE=1 env var or use `accelerate launch` to enable multi-GPU.
+
     Subclasses must implement:
-    - compute_loss(): Algorithm-specific loss computation
+        compute_loss(inputs: dict) -> torch.Tensor
     """
 
     def __init__(
@@ -74,185 +88,314 @@ class BaseRLTrainer(ABC):
         rollout_engine: RolloutEngine,
         reward_engine: BaseReward,
         tokenizer: PreTrainedTokenizerBase,
-        sampler: Optional[Sampler] = None
+        sampler: Optional[Sampler] = None,
     ):
-        """
-        Args:
-            model: Policy model to train
-            ref_model: Reference model (frozen)
-            config: Training configuration
-            train_dataset: HuggingFace Dataset
-            rollout_engine: RolloutEngine for generation
-            reward_engine: Reward function
-            tokenizer: Tokenizer
-            sampler: Optional custom sampler
-        """
-        self.model = model
-        self.ref_model = ref_model
         self.config = config
         self.train_dataset = train_dataset
         self.rollout_engine = rollout_engine
         self.reward_engine = reward_engine
         self.tokenizer = tokenizer
         self.sampler = sampler
-
-        self.device = config.device
         self.global_step = 0
+        self._metrics_history: list[dict] = []
 
-        # Move models to device
-        self.model.to(self.device)
+        # ── Accelerate setup ──────────────────────────────────────────────
+        try:
+            from accelerate import Accelerator
+            self.accelerator = Accelerator(
+                gradient_accumulation_steps=config.gradient_accumulation_steps,
+                log_with=config.report_to if config.report_to != "none" else None,
+            )
+            self._use_accelerate = True
+        except ImportError:
+            self.accelerator = None
+            self._use_accelerate = False
+            logger.warning(
+                "accelerate not installed — running single-GPU. "
+                "Install with: pip install accelerate"
+            )
+
+        self.device = (
+            self.accelerator.device
+            if self._use_accelerate
+            else torch.device(config.device)
+        )
+
+        # ── Models ────────────────────────────────────────────────────────
+        self.model = model
+        self.ref_model = ref_model
+        if not self._use_accelerate:
+            self.model.to(self.device)
         if self.ref_model is not None:
+            # ref_model stays on same device as model; never wrapped by accelerate
             self.ref_model.to(self.device)
             self.ref_model.eval()
+            for p in self.ref_model.parameters():
+                p.requires_grad_(False)
 
-        # Setup optimizer
+        # ── Optimizer ─────────────────────────────────────────────────────
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=config.learning_rate
+            lr=config.learning_rate,
         )
 
-        # Setup scheduler
-        total_steps = (len(train_dataset) // config.per_device_batch_size) * config.num_epochs
+        # ── Scheduler ─────────────────────────────────────────────────────
+        steps_per_epoch = len(train_dataset) // config.per_device_batch_size
+        total_steps = steps_per_epoch * config.num_epochs
         self.scheduler = get_scheduler(
-            "linear",
+            "cosine",
             optimizer=self.optimizer,
             num_warmup_steps=config.warmup_steps,
-            num_training_steps=total_steps
+            num_training_steps=total_steps,
         )
+
+        # ── Accelerate: wrap model + optimizer ────────────────────────────
+        if self._use_accelerate:
+            self.model, self.optimizer, self.scheduler = self.accelerator.prepare(
+                self.model, self.optimizer, self.scheduler
+            )
+
+        # ── Logging backends ──────────────────────────────────────────────
+        self._tb_writer = None
+        if config.report_to == "tensorboard":
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                log_dir = os.path.join(config.output_dir, "tb_logs")
+                self._tb_writer = SummaryWriter(log_dir=log_dir)
+                logger.info(f"TensorBoard logging → {log_dir}")
+            except ImportError:
+                logger.warning("tensorboard not installed, skipping TB logging")
+
+        if config.report_to == "wandb" and self._use_accelerate:
+            self.accelerator.init_trackers(
+                project_name="CleanOneRec",
+                config=vars(config),
+                init_kwargs={"wandb": {"name": config.run_name}},
+            )
+
+        is_main = (not self._use_accelerate) or self.accelerator.is_main_process
+        if is_main:
+            n_gpu = (
+                self.accelerator.num_processes
+                if self._use_accelerate
+                else (1 if str(self.device) != "cpu" else 0)
+            )
+            logger.info(f"Training on {n_gpu} GPU(s), device={self.device}")
+            logger.info(f"Dataset: {len(train_dataset)} samples, "
+                        f"{total_steps} total steps")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Public API
+    # ─────────────────────────────────────────────────────────────────────
 
     def train(self):
         """Main training loop."""
-        logger.info("Starting training...")
+        is_main = (not self._use_accelerate) or self.accelerator.is_main_process
 
-        # Create dataloader
         dataloader = DataLoader(
             self.train_dataset,
             batch_size=self.config.per_device_batch_size,
             sampler=self.sampler,
-            collate_fn=lambda x: x  # No collation needed
+            collate_fn=lambda x: x,
         )
+        if self._use_accelerate:
+            dataloader = self.accelerator.prepare(dataloader)
 
         self.model.train()
+        t_start = time.time()
 
         for epoch in range(self.config.num_epochs):
-            logger.info(f"Epoch {epoch + 1}/{self.config.num_epochs}")
+            if is_main:
+                logger.info(f"{'='*60}")
+                logger.info(f"Epoch {epoch + 1} / {self.config.num_epochs}")
 
-            for step, batch in enumerate(tqdm(dataloader, desc="Training")):
-                loss = self._training_step(batch)
+            pbar = tqdm(
+                dataloader,
+                desc=f"Epoch {epoch+1}",
+                disable=not is_main,
+                dynamic_ncols=True,
+            )
 
-                if (step + 1) % self.config.logging_steps == 0:
-                    logger.info(f"Step {self.global_step}, Loss: {loss:.4f}")
+            for step, batch in enumerate(pbar):
+                loss, metrics = self._training_step(batch)
 
-                if (step + 1) % self.config.save_steps == 0:
+                if is_main and (self.global_step + 1) % self.config.logging_steps == 0:
+                    self._log_metrics(metrics, step=self.global_step)
+                    pbar.set_postfix(
+                        loss=f"{metrics['loss']:.4f}",
+                        reward=f"{metrics['reward_mean']:.3f}",
+                        lr=f"{metrics['lr']:.2e}",
+                    )
+
+                if is_main and (self.global_step + 1) % self.config.save_steps == 0:
                     self._save_checkpoint()
 
                 self.global_step += 1
 
-        logger.info("Training completed!")
-        self._save_checkpoint(final=True)
+        if is_main:
+            elapsed = time.time() - t_start
+            logger.info(f"Training done in {elapsed/60:.1f} min")
+            self._save_checkpoint(final=True)
 
-    def _training_step(self, batch: list[dict]) -> float:
-        """Single training step."""
-        # Prepare inputs (rollout + reward computation)
+        if self._use_accelerate and self.config.report_to == "wandb":
+            self.accelerator.end_training()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Internal
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _training_step(self, batch: list[dict]) -> tuple[float, dict]:
+        """Single training step. Returns (loss_value, metrics_dict)."""
         inputs = self._prepare_inputs(batch)
-
-        # Compute loss (algorithm-specific)
         loss = self.compute_loss(inputs)
 
-        # Backward pass
-        loss = loss / self.config.gradient_accumulation_steps
-        loss.backward()
+        if self._use_accelerate:
+            self.accelerator.backward(loss / self.config.gradient_accumulation_steps)
+        else:
+            (loss / self.config.gradient_accumulation_steps).backward()
 
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(),
-            self.config.max_grad_norm
-        )
-
-        # Optimizer step
         if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+            if self._use_accelerate:
+                self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), self.config.max_grad_norm
+                )
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.max_grad_norm
+                )
             self.optimizer.step()
             self.scheduler.step()
             self.optimizer.zero_grad()
 
-        return loss.item() * self.config.gradient_accumulation_steps
+        rewards = inputs["rewards"]
+        metrics = {
+            "loss":         loss.item(),
+            "reward_mean":  rewards.mean().item(),
+            "reward_max":   rewards.max().item(),
+            "reward_min":   rewards.min().item(),
+            "reward_std":   rewards.std().item(),
+            "advantage_mean": inputs["advantages"].mean().item(),
+            "lr":           self.scheduler.get_last_lr()[0],
+        }
+        return loss.item(), metrics
 
     def _prepare_inputs(self, batch: list[dict]) -> dict:
         """
-        Prepare inputs for loss computation.
-
-        This includes:
-        1. Generating completions via RolloutEngine
-        2. Computing rewards via RewardEngine
-        3. Computing reference log probabilities
-        4. Computing advantages (for policy gradient methods)
+        Rollout + reward + reference logprobs + advantages.
+        Called once per training step.
         """
-        prompts = [x["prompt"] for x in batch]
-        targets = [x.get("target_sid", "") for x in batch]
-        longview_histories = [x.get("longview_history", []) for x in batch]
-        target_pids_list = [x.get("target_pids", []) for x in batch]
+        prompts              = [x["prompt"]                       for x in batch]
+        targets              = [x.get("target_sid", "")           for x in batch]
+        longview_histories   = [x.get("longview_history", [])     for x in batch]
+        target_pids_list     = [x.get("target_pids", [])          for x in batch]
 
-        # Generate completions
+        # ── Generation ────────────────────────────────────────────────────
+        # unwrap DDP model for generation
+        gen_model = (
+            self.accelerator.unwrap_model(self.model)
+            if self._use_accelerate else self.model
+        )
         prompt_ids, completion_ids, completion_mask = self.rollout_engine.generate(
             prompts=prompts,
-            model=self.model,
+            model=gen_model,
             max_new_tokens=self.config.max_completion_length,
             temperature=self.config.temperature,
-            num_return_sequences=self.config.num_generations
+            num_return_sequences=self.config.num_generations,
         )
 
-        # Decode completions
         completions = self.rollout_engine.decode_completions(completion_ids)
 
+        # ── Debug log on first step ───────────────────────────────────────
         if self.global_step == 0:
-            logger.info(f"[DEBUG] Sample completions (first 3):")
-            for i, comp in enumerate(completions[:3]):
-                logger.info(f"  [{i}] {comp[:100]}")
+            logger.info("[step-0] Sample completions:")
+            for i, c in enumerate(completions[:3]):
+                logger.info(f"  [{i}] {c[:120]}")
 
-        # Compute rewards
+        # ── Rewards ───────────────────────────────────────────────────────
+        G = self.config.num_generations
         reward_kwargs = {
-            "target_sid": targets * self.config.num_generations,
-            "longview_history": longview_histories * self.config.num_generations,
-            "target_pids": target_pids_list * self.config.num_generations,
+            "target_sid":       targets             * G,
+            "longview_history": longview_histories  * G,
+            "target_pids":      target_pids_list    * G,
         }
-        rewards = self.reward_engine(
-            prompts=prompts * self.config.num_generations,
+        rewards_list = self.reward_engine(
+            prompts=prompts * G,
             completions=completions,
-            **reward_kwargs
+            **reward_kwargs,
         )
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        rewards = torch.tensor(rewards_list, dtype=torch.float32, device=self.device)
 
         if self.global_step == 0:
-            logger.info(f"[DEBUG] Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}")
-            logger.info(f"[DEBUG] Rewards (first 6): {rewards[:6].tolist()}")
+            logger.info(
+                f"[step-0] Rewards  min={rewards.min():.4f}  "
+                f"max={rewards.max():.4f}  mean={rewards.mean():.4f}"
+            )
 
-        # Compute advantages (group-wise normalization)
-        mean_grouped_rewards = rewards.view(-1, self.config.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.config.num_generations).std(dim=1)
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.config.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.config.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        # ── Advantages (group-wise normalisation) ─────────────────────────
+        r_grouped  = rewards.view(-1, G)
+        mean_r     = r_grouped.mean(dim=1, keepdim=True).repeat_interleave(G, dim=0).squeeze()
+        std_r      = r_grouped.std(dim=1, keepdim=True).repeat_interleave(G, dim=0).squeeze()
+        advantages = (rewards - mean_r) / (std_r + 1e-4)
 
-        # Compute reference log probabilities
+        # ── Reference log-probs ───────────────────────────────────────────
         prompt_mask = (prompt_ids != self.tokenizer.pad_token_id).int()
+        ref_model   = self.ref_model if self.ref_model is not None else gen_model
         ref_per_token_logps = self.rollout_engine.compute_ref_logprobs(
             prompt_ids=prompt_ids,
             completion_ids=completion_ids,
             prompt_mask=prompt_mask,
             completion_mask=completion_mask,
-            ref_model=self.ref_model if self.ref_model is not None else self.model
+            ref_model=ref_model,
         )
         ref_per_token_logps = ref_per_token_logps.to(self.device)
 
         return {
-            "prompt_ids": prompt_ids,
-            "prompt_mask": prompt_mask,
-            "completion_ids": completion_ids,
-            "completion_mask": completion_mask,
-            "ref_per_token_logps": ref_per_token_logps,
-            "advantages": advantages,
-            "rewards": rewards
+            "prompt_ids":           prompt_ids,
+            "prompt_mask":          prompt_mask,
+            "completion_ids":       completion_ids,
+            "completion_mask":      completion_mask,
+            "ref_per_token_logps":  ref_per_token_logps,
+            "advantages":           advantages,
+            "rewards":              rewards,
         }
+
+    def _log_metrics(self, metrics: dict, step: int):
+        """Write metrics to all enabled backends."""
+        self._metrics_history.append({"step": step, **metrics})
+
+        # Console
+        logger.info(
+            f"step={step:4d}  loss={metrics['loss']:.4f}  "
+            f"reward={metrics['reward_mean']:.3f}±{metrics['reward_std']:.3f}  "
+            f"lr={metrics['lr']:.2e}"
+        )
+
+        # TensorBoard
+        if self._tb_writer is not None:
+            for k, v in metrics.items():
+                self._tb_writer.add_scalar(f"train/{k}", v, step)
+
+        # wandb (via accelerate tracker)
+        if self._use_accelerate and self.config.report_to == "wandb":
+            self.accelerator.log({f"train/{k}": v for k, v in metrics.items()}, step=step)
+
+    def _save_checkpoint(self, final: bool = False):
+        """Save model + tokenizer checkpoint (only on main process)."""
+        suffix    = "final" if final else f"step_{self.global_step}"
+        save_path = os.path.join(self.config.output_dir, suffix)
+        os.makedirs(save_path, exist_ok=True)
+
+        save_model = (
+            self.accelerator.unwrap_model(self.model)
+            if self._use_accelerate else self.model
+        )
+        save_model.save_pretrained(save_path)
+        self.tokenizer.save_pretrained(save_path)
+        logger.info(f"Checkpoint saved → {save_path}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Abstract
+    # ─────────────────────────────────────────────────────────────────────
 
     @abstractmethod
     def compute_loss(self, inputs: dict) -> torch.Tensor:
@@ -260,27 +403,11 @@ class BaseRLTrainer(ABC):
         Compute algorithm-specific loss.
 
         Args:
-            inputs: Dictionary containing:
-                - prompt_ids: [batch, prompt_len]
-                - completion_ids: [batch, completion_len]
-                - prompt_mask: [batch, prompt_len]
-                - completion_mask: [batch, completion_len]
-                - ref_per_token_logps: [batch, completion_len]
-                - advantages: [batch]
-                - rewards: [batch]
+            inputs: dict with keys:
+                prompt_ids, prompt_mask, completion_ids, completion_mask,
+                ref_per_token_logps, advantages, rewards
 
         Returns:
-            Scalar loss tensor
+            Scalar loss tensor (do NOT call .backward() — trainer handles it)
         """
         raise NotImplementedError
-
-    def _save_checkpoint(self, final: bool = False):
-        """Save model checkpoint."""
-        import os
-        suffix = "final" if final else f"step_{self.global_step}"
-        save_path = os.path.join(self.config.output_dir, suffix)
-        os.makedirs(save_path, exist_ok=True)
-
-        self.model.save_pretrained(save_path)
-        self.tokenizer.save_pretrained(save_path)
-        logger.info(f"Checkpoint saved to {save_path}")

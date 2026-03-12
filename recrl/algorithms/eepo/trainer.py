@@ -158,9 +158,15 @@ class EEPOTrainer(BaseRLTrainer):
         completions = self.rollout_engine.decode_completions(completion_ids)
 
         # Compute rewards
-        reward_kwargs = {"target_sid": targets * self.config.num_generations}
+        longview_histories = [x.get("longview_history", []) for x in batch]
+        target_pids_list = [x.get("target_pids", []) for x in batch]
+        reward_kwargs = {
+            "target_sid": targets * self.config.num_generations,
+            "longview_history": longview_histories * self.config.num_generations,
+            "target_pids": target_pids_list * self.config.num_generations,
+        }
         rewards = self.reward_engine(
-            prompts=prompts,
+            prompts=prompts * self.config.num_generations,
             completions=completions,
             **reward_kwargs
         )
