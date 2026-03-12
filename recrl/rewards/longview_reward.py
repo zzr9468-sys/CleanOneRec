@@ -165,7 +165,23 @@ class LongviewBasedReward:
                 continue
 
             # 解析生成的 SID -> Caption
-            gen_caption = self._get_caption_from_sid(completion)
+            # 注意：completion 可能包含多个 SID，只取第一个
+            import re
+            sid_pattern = r'<\|sid_begin\|>.*?<\|sid_end\|>'
+            sids = re.findall(sid_pattern, completion)
+
+            if len(sids) == 0:
+                rewards.append(-10.0)
+                continue
+
+            first_sid = sids[0]
+            gen_caption = self._get_caption_from_sid(first_sid)
+
+            if i == 0 and not hasattr(self, '_debug_printed'):
+                self._debug_printed = True
+                print(f"[DEBUG Longview] First SID: {first_sid}")
+                print(f"[DEBUG Longview] Caption: {gen_caption[:100] if gen_caption else 'None'}")
+                print(f"[DEBUG Longview] Longview history size: {len(longview_captions)}")
 
             if gen_caption is None:
                 # 无效的 SID，给予惩罚

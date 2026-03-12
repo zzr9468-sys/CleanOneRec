@@ -76,7 +76,13 @@ class DataEngine:
         if sample_num > 0 and sample_num < len(df):
             df = df.sample(n=sample_num, random_state=seed).reset_index(drop=True)
 
-        dataset_dict = {"prompt": [], "completion": [], "target_sid": []}
+        dataset_dict = {
+            "prompt": [],
+            "completion": [],
+            "target_sid": [],
+            "longview_history": [],
+            "target_pids": []
+        }
 
         for _, row in df.iterrows():
             msgs = row['messages']
@@ -98,9 +104,19 @@ class DataEngine:
             if not target_sid:
                 continue
 
+            # Extract longview history (list of PIDs)
+            longview_pids = []
+            if 'hist_pid' in row and row['hist_pid'] is not None:
+                longview_pids = row['hist_pid'].tolist() if hasattr(row['hist_pid'], 'tolist') else list(row['hist_pid'])
+
+            # Extract target PIDs
+            target_pids = meta.get('answer_pid', [])
+
             dataset_dict["prompt"].append(prompt_str)
             dataset_dict["completion"].append(target_sid)
             dataset_dict["target_sid"].append(target_sid)
+            dataset_dict["longview_history"].append(longview_pids)
+            dataset_dict["target_pids"].append(target_pids)
 
         hf_dataset = Dataset.from_dict(dataset_dict)
         logger.info(f"Loaded {len(hf_dataset)} samples")

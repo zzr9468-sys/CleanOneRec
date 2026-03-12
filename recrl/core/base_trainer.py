@@ -189,6 +189,8 @@ class BaseRLTrainer(ABC):
         """
         prompts = [x["prompt"] for x in batch]
         targets = [x.get("target_sid", "") for x in batch]
+        longview_histories = [x.get("longview_history", []) for x in batch]
+        target_pids_list = [x.get("target_pids", []) for x in batch]
 
         # Generate completions
         prompt_ids, completion_ids, completion_mask = self.rollout_engine.generate(
@@ -202,14 +204,27 @@ class BaseRLTrainer(ABC):
         # Decode completions
         completions = self.rollout_engine.decode_completions(completion_ids)
 
+        if self.global_step == 0:
+            logger.info(f"[DEBUG] Sample completions (first 3):")
+            for i, comp in enumerate(completions[:3]):
+                logger.info(f"  [{i}] {comp[:100]}")
+
         # Compute rewards
-        reward_kwargs = {"target_sid": targets * self.config.num_generations}
+        reward_kwargs = {
+            "target_sid": targets * self.config.num_generations,
+            "longview_history": longview_histories * self.config.num_generations,
+            "target_pids": target_pids_list * self.config.num_generations,
+        }
         rewards = self.reward_engine(
             prompts=prompts * self.config.num_generations,
             completions=completions,
             **reward_kwargs
         )
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+
+        if self.global_step == 0:
+            logger.info(f"[DEBUG] Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}")
+            logger.info(f"[DEBUG] Rewards (first 6): {rewards[:6].tolist()}")
 
         # Compute advantages (group-wise normalization)
         mean_grouped_rewards = rewards.view(-1, self.config.num_generations).mean(dim=1)
@@ -227,6 +242,7 @@ class BaseRLTrainer(ABC):
             completion_mask=completion_mask,
             ref_model=self.ref_model if self.ref_model is not None else self.model
         )
+        ref_per_token_logps = ref_per_token_logps.to(self.device)
 
         return {
             "prompt_ids": prompt_ids,

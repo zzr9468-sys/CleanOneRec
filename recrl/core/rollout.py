@@ -156,6 +156,9 @@ class RolloutEngine:
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
         with torch.inference_mode():
+            ref_device = next(ref_model.parameters()).device
+            prompt_completion_ids = prompt_completion_ids.to(ref_device)
+            attention_mask = attention_mask.to(ref_device)
             logits = ref_model(
                 input_ids=prompt_completion_ids,
                 attention_mask=attention_mask

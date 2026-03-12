@@ -121,9 +121,23 @@ class NoveltyReward:
         """
         rewards = []
 
-        for completion in completions:
+        for i, completion in enumerate(completions):
+            # 提取第一个 SID（completion 可能包含多个 SID）
+            sid_pattern = r'<\|sid_begin\|>.*?<\|sid_end\|>'
+            sids = re.findall(sid_pattern, completion)
+
+            if len(sids) == 0:
+                rewards.append(-10.0)
+                continue
+
+            first_sid = sids[0]
+
+            if i == 0 and not hasattr(self, '_debug_printed'):
+                self._debug_printed = True
+                print(f"[DEBUG Novelty] First SID: {first_sid}")
+
             # 解析 SID -> PID
-            pid = self._get_pid_from_sid(completion)
+            pid = self._get_pid_from_sid(first_sid)
 
             if pid is None:
                 # 无效的 SID，给予惩罚
