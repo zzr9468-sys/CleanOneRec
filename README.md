@@ -18,7 +18,7 @@ RecRL requires Python 3.8+ and PyTorch 2.0+.
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/RecRL.git
+git clone https://github.com/yourusername/RecRL.git](https://github.com/zzr9468-sys/CleanOneRec.git
 cd RecRL
 
 # Install in editable mode
