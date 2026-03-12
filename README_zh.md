@@ -14,92 +14,96 @@ RecRL 是一个干净、模块化且高度可扩展的强化学习（RL）框架
 
 ## 📦 安装指南
 
-环境要求: Python 3.8+ 和 PyTorch 2.0+。
+环境要求: Python 3.10+ 和 PyTorch 2.0+。
+
+### 使用 uv 安装（推荐）
 
 ```bash
-# 克隆仓库
-https://github.com/zzr9468-sys/CleanOneRec.git
-cd RecRL
+# 安装 uv
+curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# 使用可编辑模式安装
+# 克隆仓库
+git clone https://github.com/zzr9468-sys/CleanOneRec.git
+cd CleanOneRec
+
+# 安装依赖
+uv sync
+
+# 激活环境
+source .venv/bin/activate
+```
+
+### 使用 pip 安装
+
+```bash
+git clone https://github.com/zzr9468-sys/CleanOneRec.git
+cd CleanOneRec
 pip install -e .
 ```
 
+详细安装说明请参考 [安装指南](docs/INSTALLATION.md)。
+
 ## 🚀 快速上手
 
-### 1. 标准 GRPO 训练
+### 单卡训练（推荐）
+
+```bash
+# GRPO + 约束解码
+bash train_constrained.sh
+```
+
+使用前缀树约束解码，确保只生成合法的物品 ID。
+
+### 多卡训练
+
+```bash
+# 4 卡 Accelerate DDP
+bash train_multi_gpu.sh
+```
+
+### EEPO 训练（增强探索）
+
+```bash
+# EEPO 快速权重探索
+bash train_eepo.sh
+```
+
+### 自定义训练
 
 ```python
 from recrl.core import DataEngine, RolloutEngine
 from recrl.algorithms.grpo import GRPOTrainer, GRPOConfig
-from recrl.rewards import TextSemanticReward
-from recrl.data import RepeatRandomSampler
+from recrl.rewards import CompositeReward, LongviewReward, SemanticReward
+from recrl.constraints import SIDTrie
 
-# 加载推荐数据集 (支持 OpenOneRec RecIF / Parquet 格式)
-train_dataset = DataEngine.from_parquet("data/train.parquet", format="recif")
+# 加载数据
+train_dataset = DataEngine.from_recif_parquet(“data/train.parquet”)
 
-# 初始化核心引擎
-rollout_engine = RolloutEngine(tokenizer, device="cuda")
-reward_engine = TextSemanticReward(recif_path="data/recif_metadata")
+# 配置引擎
+rollout_engine = RolloutEngine(tokenizer, device=”cuda”)
+trie = SIDTrie.from_recif(“path/to/RecIF”, tokenizer)
+rollout_engine.set_trie(trie)
 
-# 配置训练器与采样器
-config = GRPOConfig(num_generations=16, temperature=0.7)
-sampler = RepeatRandomSampler(train_dataset, repeat_count=16)
+# 复合奖励
+reward_engine = CompositeReward([
+    (LongviewReward(“path/to/RecIF”), 0.5),
+    (SemanticReward(“path/to/RecIF”), 0.3),
+])
 
-# 启动训练
+# 训练
+config = GRPOConfig(num_generations=4, temperature=0.7)
 trainer = GRPOTrainer(
     model=model,
-    ref_model=ref_model,
     config=config,
     train_dataset=train_dataset,
     rollout_engine=rollout_engine,
     reward_engine=reward_engine,
     tokenizer=tokenizer,
-    sampler=sampler
 )
 trainer.train()
 ```
 
-### 2. EEPO (快速权重探索) 训练
-
-EEPO 通过在生成阶段对 `lm_head` 执行即时的 Fast-Weight 更新，强制模型进行探索，有效打破传统基于模仿学习的“师生曝光偏差”。
-
-```python
-from recrl.algorithms.eepo import EEPOTrainer, EEPOConfig
-
-config = EEPOConfig(
-    num_generations=16,
-    eepo_enabled=True,
-    eepo_stage1_ratio=0.5,  # 50% 模型利用 (Exploitation), 50% 强制探索 (Exploration)
-    eepo_unlearn_lr=1e-5,
-    add_gt=True
-)
-
-trainer = EEPOTrainer(
-    model=model,
-    config=config,
-    train_dataset=train_dataset,
-    rollout_engine=rollout_engine,
-    reward_engine=reward_engine,
-    tokenizer=tokenizer,
-    sampler=sampler
-)
-trainer.train()
-```
-
-### 3. 组合多个奖励函数
-
-你可以使用 `CompositeReward` 轻松平衡相关性、新颖性和准确率：
-
-```python
-from recrl.core import CompositeReward
-from recrl.rewards import TextSemanticReward, ExactMatchReward
-
-reward_engine = CompositeReward([
-    (TextSemanticReward(recif_path="data/"), 0.8),  # 80% 权重由语义相似度决定
-    (ExactMatchReward(), 0.2)                       # 20% 权重由 ID 完全匹配决定
-])
-```
+详细训练教程请参考 [训练指南](docs/TRAINING.md)。
 
 ## 🏗 架构总览
 
@@ -108,29 +112,134 @@ reward_engine = CompositeReward([
 ```text
 recrl/
 ├── core/                       # 核心基类抽象
-│   ├── base_trainer.py         # 训练主循环 (BaseRLTrainer)
-│   ├── rollout.py              # 文本生成与 Logprobs 算子 (RolloutEngine)
-│   ├── reward.py               # 奖励基类与接口 (CompositeReward)
-│   └── data.py                 # 统一数据解析 (DataEngine)
+│   ├── base_trainer.py         # 训练主循环（支持多卡）
+│   ├── rollout.py              # 文本生成与 Logprobs 算子
+│   ├── reward.py               # 奖励基类与接口
+│   └── data.py                 # 统一数据解析
 ├── algorithms/                 # 具体强化学习算法实现
 │   ├── grpo/                   # 标准 GRPO
-│   └── eepo/                   # EEPO (Unlearn / 权重突变)
+│   │   ├── trainer.py          # GRPO 训练器
+│   │   └── config.py           # GRPO 配置
+│   └── eepo/                   # EEPO（快速权重探索）
+│       ├── trainer.py          # EEPO 训练器
+│       ├── unlearn.py          # 快速权重反学习
+│       └── config.py           # EEPO 配置
 ├── rewards/                    # 可插拔的奖励函数库
-│   ├── semantic.py             # 引入 Sentence-Transformer 算语义分
-│   └── rule.py                 # 精确匹配与 NDCG 计算
+│   ├── longview_reward.py      # 用户历史对齐
+│   ├── semantic.py             # 语义相似度
+│   ├── novelty_reward.py       # 新颖性奖励
+│   └── diversity_reward.py     # 多样性奖励
 ├── constraints/                # 强制合规生成控制
 │   ├── trie.py                 # 针对有效 SID 的前缀树
-│   └── processor.py            # 安全防 NaN 的 ConstrainedLogitsProcessor
-└── examples/                   # 开箱即用的参考训练脚本
+│   └── processor.py            # ConstrainedLogitsProcessor
+└── data/                       # 数据工具
+    └── sampler.py              # RepeatRandomSampler
 ```
+
+## 📊 性能表现
+
+### 约束解码 vs 非约束解码
+
+| 指标 | 非约束 | 约束 | 提升 |
+|------|--------|------|------|
+| 平均奖励 | -0.19 | **0.78** | **+488%** |
+| 有效 SID 率 | ~50% | **100%** | **+100%** |
+| 正奖励率 | 48.9% | **99.7%** | **+104%** |
+
+**结论**: 约束解码对 RecRL 至关重要。
+
+### 训练效率
+
+| 配置 | 步数/秒 | GPU 显存 | 每轮耗时 |
+|------|---------|----------|----------|
+| 单卡 | 0.12 | 20GB | ~46 小时 |
+| 4 卡 (DDP) | 0.45 | 20GB/卡 | ~12 小时 |
+
+详细性能分析请参考 [性能基准](docs/BENCHMARKS.md)。
+
+## 📚 文档
+
+- [安装指南](docs/INSTALLATION.md) - 环境配置和安装步骤
+- [训练指南](docs/TRAINING.md) - 单卡/多卡训练、超参数调优
+- [算法文档](docs/ALGORITHMS.md) - GRPO、EEPO、约束解码、奖励设计
+- [性能基准](docs/BENCHMARKS.md) - 性能对比和消融实验
+
+## 🎯 核心功能详解
+
+### 约束解码
+
+基于前缀树的 logits 处理器，确保只生成合法的语义 ID（SID）：
+
+```python
+from recrl.constraints import SIDTrie
+
+# 从 RecIF 元数据构建前缀树
+trie = SIDTrie.from_recif("path/to/RecIF", tokenizer)
+rollout_engine.set_trie(trie)
+```
+
+**效果**: 相比非约束生成，奖励提升 488%。
+
+### EEPO（探索-评估）
+
+两阶段生成，带快速权重探索：
+
+1. **利用阶段**（50%）：用当前策略生成
+2. **探索阶段**（50%）：应用快速权重突变后生成
+
+**优势**: 跳出局部最优，提升多样性。
+
+### 复合奖励
+
+灵活的奖励组合：
+
+```python
+reward_engine = CompositeReward([
+    (LongviewReward(recif_path), 0.50),   # 用户历史对齐
+    (SemanticReward(recif_path), 0.30),   # 内容相似度
+    (NoveltyReward(), 0.15),              # 探索奖励
+    (DiversityReward(), 0.05),            # 组内多样性
+])
+```
+
+### 内存优化
+
+- **梯度检查点**: 节省约 40% GPU 显存
+- **参考模型 CPU 卸载**: 节省约 3.4GB GPU 显存
+- **混合精度（bf16）**: 节省约 50% 显存
+
+**结果**: 1.7B 模型可在 24GB GPU 上训练。
 
 ## 🤝 参与贡献
 
 欢迎提交 Issue 和 Pull Request！如果想要加入新算法（例如 DPO）：
-1. 在 `recrl/algorithms/dpo/` 创建目录。
-2. 继承 `BaseRLTrainer`，只需重写其中的 `compute_loss()`。
-3. 你的算法会自动继承来自父类的合规解码约束、组合奖励分配以及批次数据加载能力。
+
+1. 在 `recrl/algorithms/dpo/` 创建目录
+2. 继承 `BaseRLTrainer`，只需重写其中的 `compute_loss()`
+3. 你的算法会自动继承来自父类的合规解码约束、组合奖励分配以及批次数据加载能力
+
+详细贡献指南请参考 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 📝 引用
+
+如果你在研究中使用了 RecRL，请引用：
+
+```bibtex
+@software{recrl2025,
+  title = {RecRL: Reinforcement Learning Framework for Recommendation LLMs},
+  author = {Zhou, Ziren},
+  year = {2025},
+  url = {https://github.com/zzr9468-sys/CleanOneRec}
+}
+```
+
+## 🙏 致谢
+
+- [OpenOneRec](https://github.com/OpenOneRec) 提供 RecIF 基准和 OneRec 模型
+- [TRL](https://github.com/huggingface/trl) 提供 RL 训练工具
+- [Accelerate](https://github.com/huggingface/accelerate) 提供多卡训练支持
+- [SwanLab](https://swanlab.cn) 提供实验跟踪平台
 
 ## 📄 开源协议
 
-本项目基于 Apache 2.0 协议开源。
+本项目基于 Apache 2.0 协议开源 - 详见 [LICENSE](LICENSE)。

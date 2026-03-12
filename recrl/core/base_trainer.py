@@ -256,6 +256,14 @@ class BaseRLTrainer(ABC):
     def _training_step(self, batch: list[dict]) -> tuple[float, dict]:
         """Single training step. Returns (loss_value, metrics_dict)."""
         inputs = self._prepare_inputs(batch)
+
+        # Move inputs to model's device (important for multi-GPU)
+        model_device = next(self.model.parameters()).device
+        inputs = {
+            k: v.to(model_device) if isinstance(v, torch.Tensor) else v
+            for k, v in inputs.items()
+        }
+
         loss = self.compute_loss(inputs)
 
         if self._use_accelerate:

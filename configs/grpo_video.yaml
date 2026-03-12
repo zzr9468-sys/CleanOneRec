@@ -13,8 +13,8 @@ device:      cuda:0   # physical GPU selected via CUDA_VISIBLE_DEVICES
 num_epochs:                1
 per_device_batch_size:     2
 gradient_accumulation_steps: 4
-learning_rate:             1.0e-6
-warmup_steps:              10
+learning_rate:             5.0e-6  # Increased from 1e-6 for visible loss updates
+warmup_steps:              50      # Extended warmup for stable training
 max_grad_norm:             1.0
 
 # Generation

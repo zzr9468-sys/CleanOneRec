@@ -54,9 +54,10 @@ class ConstrainedLogitsProcessor(LogitsProcessor):
             allowed_tokens = self.get_allowed_tokens_fn(completion_ids)
 
             if allowed_tokens:
-                # Create mask
+                # Create mask on the same device as scores
                 mask = torch.ones(vocab_size, dtype=torch.bool, device=scores.device)
-                mask[list(allowed_tokens)] = False
+                allowed_indices = torch.tensor(list(allowed_tokens), dtype=torch.long, device=scores.device)
+                mask[allowed_indices] = False
 
                 # Set disallowed tokens to -inf
                 scores[i, mask] = float('-inf')

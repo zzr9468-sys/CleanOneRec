@@ -5,12 +5,63 @@ build/
 dist/
 wheels/
 *.egg-info
+.pytest_cache/
 
 # Virtual environments
 .venv
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 
 # Large model / output artifacts
 outputs/
 test_output/
 *.safetensors
 *.pt
+*.bin
+*.pth
+
+# Training logs
+logs/
+*.log
+wandb/
+swanlab/
+
+# Data files (too large)
+data/
+*.parquet
+*.json.gz
+*.csv.gz
+
+# Checkpoints
+checkpoints/
+*.ckpt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Project-specific (internal docs, not for public)
+IMPLEMENTATION_STATUS.md
+GRPO_VS_EEPO.md
+PROJECT_SUMMARY.md
+
+# Temporary test scripts (not part of the framework)
+run_baseline.py
+run_test.py
+run_final_test.sh
+test_full_chain.py
+test_reward_fix.py
+test_reward_only.py
+test_sid_parsing.py
