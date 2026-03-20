@@ -127,7 +127,7 @@ class NoveltyReward:
             sids = re.findall(sid_pattern, completion)
 
             if len(sids) == 0:
-                rewards.append(-10.0)
+                rewards.append(-1.0)
                 continue
 
             first_sid = sids[0]
@@ -141,7 +141,7 @@ class NoveltyReward:
 
             if pid is None:
                 # 无效的 SID，给予惩罚
-                rewards.append(-10.0)
+                rewards.append(-1.0)
                 continue
 
             # 计算新颖性

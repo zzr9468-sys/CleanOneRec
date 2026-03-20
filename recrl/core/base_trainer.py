@@ -29,6 +29,7 @@ from datasets import Dataset
 from tqdm import tqdm
 import logging
 
+from trl.trainer.utils import selective_log_softmax
 from .rollout import RolloutEngine
 from .reward import BaseReward
 from .data import DataEngine
@@ -359,8 +360,8 @@ class BaseRLTrainer(ABC):
 
         # ── Advantages (group-wise normalisation) ─────────────────────────
         r_grouped  = rewards.view(-1, G)
-        mean_r     = r_grouped.mean(dim=1, keepdim=True).repeat_interleave(G, dim=0).squeeze()
-        std_r      = r_grouped.std(dim=1, keepdim=True).repeat_interleave(G, dim=0).squeeze()
+        mean_r     = r_grouped.mean(dim=1, keepdim=True).repeat_interleave(G, dim=0).view(-1)
+        std_r      = r_grouped.std(dim=1, keepdim=True).repeat_interleave(G, dim=0).view(-1)
         advantages = (rewards - mean_r) / (std_r + 1e-4)
 
         # ── Reference log-probs ───────────────────────────────────────────
@@ -384,14 +385,33 @@ class BaseRLTrainer(ABC):
             torch.cuda.empty_cache()
         ref_per_token_logps = ref_per_token_logps.to(self.device)
 
+        # ── Old log-probs (policy snapshot before gradient update) ────────
+        # Required for correct importance sampling in GRPO/PPO.
+        # Must be computed with no_grad AFTER rollout, BEFORE any optimizer step.
+        num_gens = completion_ids.size(0) // prompt_ids.size(0)
+        expanded_prompt_ids = prompt_ids.repeat_interleave(num_gens, dim=0) if num_gens > 1 else prompt_ids
+        expanded_prompt_mask = prompt_mask.repeat_interleave(num_gens, dim=0) if num_gens > 1 else prompt_mask
+        input_ids_full = torch.cat([expanded_prompt_ids, completion_ids], dim=1)
+        attn_mask_full = torch.cat([expanded_prompt_mask, completion_mask], dim=1)
+        with torch.no_grad():
+            logits_old = self.model(
+                input_ids=input_ids_full,
+                attention_mask=attn_mask_full,
+            ).logits
+        logits_old = logits_old[:, :-1, :]
+        target_ids_full = input_ids_full[:, 1:]
+        old_per_token_logps = selective_log_softmax(logits_old, target_ids_full)
+        old_per_token_logps = old_per_token_logps[:, -completion_ids.size(1):]
+
         return {
-            "prompt_ids":           prompt_ids,
-            "prompt_mask":          prompt_mask,
-            "completion_ids":       completion_ids,
-            "completion_mask":      completion_mask,
-            "ref_per_token_logps":  ref_per_token_logps,
-            "advantages":           advantages,
-            "rewards":              rewards,
+            "prompt_ids":             prompt_ids,
+            "prompt_mask":            prompt_mask,
+            "completion_ids":         completion_ids,
+            "completion_mask":        completion_mask,
+            "ref_per_token_logps":    ref_per_token_logps,
+            "old_per_token_logps":    old_per_token_logps,
+            "advantages":             advantages,
+            "rewards":                rewards,
         }
 
     def _log_metrics(self, metrics: dict, step: int):

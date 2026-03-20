@@ -104,10 +104,19 @@ class DataEngine:
             if not target_sid:
                 continue
 
-            # Extract longview history (list of PIDs)
+            # Extract longview history: use hist_longview_video_list (items the user
+            # genuinely watched long), NOT hist_pid (all exposed items including skipped).
+            # hist_pid includes exposure-biased head items; hist_longview_video_list is ~75%
+            # long-tail and is the correct anchor for LongviewBasedReward.
             longview_pids = []
-            if 'hist_pid' in row and row['hist_pid'] is not None:
-                longview_pids = row['hist_pid'].tolist() if hasattr(row['hist_pid'], 'tolist') else list(row['hist_pid'])
+            for lv_field in ('hist_longview_video_list', 'hist_pid'):
+                if lv_field in row and row[lv_field] is not None:
+                    longview_pids = (
+                        row[lv_field].tolist()
+                        if hasattr(row[lv_field], 'tolist')
+                        else list(row[lv_field])
+                    )
+                    break
 
             # Extract target PIDs
             target_pids = meta.get('answer_pid', [])
@@ -136,8 +145,9 @@ class DataEngine:
 
         for _, row in df.iterrows():
             try:
-                history_sid = eval(row['history_item_sid'])
-            except:
+                import ast
+                history_sid = ast.literal_eval(row['history_item_sid'])
+            except (ValueError, SyntaxError):
                 continue
 
             history_str = ", ".join(history_sid)

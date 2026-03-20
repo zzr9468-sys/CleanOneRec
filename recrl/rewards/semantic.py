@@ -34,7 +34,7 @@ class TextSemanticReward(BaseReward):
         recif_path: str,
         device: str = "cuda",
         validity_penalty: float = -1.0,
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+        model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     ):
         """
         Args:

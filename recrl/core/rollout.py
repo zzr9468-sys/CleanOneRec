@@ -76,8 +76,6 @@ class RolloutEngine:
 
         # Setup logits processors
         logits_processor = LogitsProcessorList()
-        if temperature > 0 and temperature != 1.0:
-            logits_processor.append(TemperatureLogitsWarper(temperature=temperature))
 
         if self.constraints is not None:
             from ..constraints.processor import ConstrainedLogitsProcessor

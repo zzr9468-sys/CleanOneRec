@@ -35,15 +35,17 @@ class LongviewBasedReward:
     def __init__(
         self,
         recif_path: str,
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         device: str = "cuda",
         validity_penalty: float = -1.0,
         encode_batch_size: int = 256,
+        recent_k: int = 20,
     ):
         self.recif_path = Path(recif_path)
         self.device = device
         self.validity_penalty = validity_penalty
         self.encode_batch_size = encode_batch_size
+        self.recent_k = recent_k
 
         self.sid2pid_dict = self._load_sid2pid()
         self.pid2caption_dict = self._load_pid2caption()
@@ -84,9 +86,9 @@ class LongviewBasedReward:
         return self.pid2caption_dict.get(pid)
 
     def _get_longview_captions(self, hist_pids: List[int]) -> List[str]:
-        """Get captions for a list of longview PIDs."""
+        """Get captions for the most recent k longview PIDs."""
         captions = []
-        for pid in hist_pids:
+        for pid in hist_pids[-self.recent_k:]:
             cap = self.pid2caption_dict.get(str(int(pid)))
             if cap:
                 captions.append(cap)
@@ -159,7 +161,10 @@ class LongviewBasedReward:
             show_progress_bar=False,
         )  # [N, D]
 
-        # ── Step 4: compute max cosine similarity per sample ──────────────
+        # ── Step 4: compute reward per sample ─────────────────────────────
+        # Reward = semantic similarity to longview history
+        #        + novelty bonus if generated item is NOT in user history
+        #        - penalty if generated item IS in user history (repetition)
         rewards: List[float] = []
         for i in range(len(completions)):
             if not valid[i]:
@@ -167,13 +172,18 @@ class LongviewBasedReward:
                 continue
 
             gen_idx, hist_start, hist_end = sample_slices[i]
-            gen_emb = all_embs[gen_idx]          # [D]
-            hist_embs = all_embs[hist_start:hist_end]  # [H, D]
+            gen_emb = all_embs[gen_idx]
+            hist_embs = all_embs[hist_start:hist_end]
 
+            # Semantic similarity to longview history (max over history items)
+            # max allows the generated item to match ANY of the user's interest clusters;
+            # mean would unfairly penalise items relevant to only one of the user's topics.
             sims = torch.nn.functional.cosine_similarity(
                 gen_emb.unsqueeze(0), hist_embs
-            )  # [H]
-            rewards.append(sims.max().item())
+            )
+            sem_score = sims.max().item()
+
+            rewards.append(sem_score)
 
         return rewards
 

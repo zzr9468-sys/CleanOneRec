@@ -1,13 +1,18 @@
 """
 RecRL Composite Reward
 
-Combines four reward signals:
-    1. Longview implicit feedback  (50%) — main signal, user true interest
-    2. Semantic similarity         (30%) — generated item vs target item
-    3. Novelty                     (15%) — encourage long-tail exploration
-    4. Diversity                   ( 5%) — avoid mode collapse within group
+Formula (multiplicative):
+    composite = max(0, lv) * nov * 0.95  +  div * 0.05
 
-All four are fully implemented. Weights are configurable.
+Rationale for multiplicative combination:
+- Additive (old): lv and nov fight each other — a popular item can score high on lv
+  alone even with nov≈0, so EEPO's long-tail exploration never gets reinforced.
+- Multiplicative (new): both signals must be satisfied simultaneously.
+  EEPO is rewarded only when the generated item is BOTH semantically aligned with
+  the user's interests (lv) AND rare in the training distribution (nov).
+  This directly aligns EEPO's exploration objective with the reward.
+
+Diversity (5%) stays additive so it's never zeroed out by low lv.
 """
 
 import logging
@@ -15,7 +20,6 @@ from typing import List, Dict, Optional
 
 from .longview_reward import LongviewBasedReward
 from .novelty_reward import NoveltyReward
-from .semantic import TextSemanticReward
 from .diversity_reward import DiversityReward
 
 logger = logging.getLogger(__name__)
@@ -25,19 +29,12 @@ class RecRLCompositeReward:
     """
     Composite reward for generative recommendation RL training.
 
-    Design rationale:
-    - Longview (50%): strongest unbiased signal — user actively watched
-    - Semantic (30%): content relevance to ground-truth target
-    - Novelty (15%): pushes model toward long-tail, underexposed items
-    - Diversity (5%): prevents all G generations collapsing to the same item
+    composite = max(0, lv) * nov * 0.95  +  div * 0.05
     """
 
-    DEFAULT_WEIGHTS = {
-        'longview':  0.50,
-        'semantic':  0.30,
-        'novelty':   0.15,
-        'diversity': 0.05,
-    }
+    # Diversity keeps a small additive weight so it is never multiplied to zero.
+    DIV_WEIGHT = 0.05
+    JOINT_WEIGHT = 0.95  # weight on the lv*nov product
 
     def __init__(
         self,
@@ -45,48 +42,27 @@ class RecRLCompositeReward:
         device: str = "cuda",
         weights: Optional[Dict[str, float]] = None,
         num_generations: int = 4,
-        semantic_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        longview_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        longview_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
     ):
-        """
-        Args:
-            recif_path:        Path to OpenOneRec-RecIF data directory
-            device:            torch device string ("cuda", "cpu", "cuda:1", ...)
-            weights:           Override default component weights (must sum to 1)
-            num_generations:   G — number of completions per prompt (for diversity)
-            semantic_model:    Sentence-transformer model for semantic reward
-            longview_model:    Sentence-transformer model for longview reward
-        """
         self.recif_path = recif_path
         self.device = device
-        self.weights = weights or self.DEFAULT_WEIGHTS
         self.num_generations = num_generations
 
-        total = sum(self.weights.values())
-        if abs(total - 1.0) > 1e-3:
-            logger.warning(f"Reward weights sum to {total:.3f}, expected 1.0")
+        # weights kwarg kept for backward compat but ignored in multiplicative mode
+        if weights is not None:
+            logger.warning(
+                "RecRLCompositeReward: 'weights' kwarg is ignored — "
+                "the reward now uses a fixed multiplicative formula."
+            )
 
-        logger.info("Initializing RecRL Composite Reward...")
-        logger.info(f"   weights: {self.weights}")
+        logger.info("Initializing RecRL Composite Reward (multiplicative mode)...")
 
-        # 1. Longview
         self.longview_reward = LongviewBasedReward(
             recif_path,
             model_name=longview_model,
             device=device,
         )
-
-        # 2. Semantic
-        self.semantic_reward = TextSemanticReward(
-            recif_path,
-            device=device,
-            model_name=semantic_model,
-        )
-
-        # 3. Novelty
         self.novelty_reward = NoveltyReward(recif_path)
-
-        # 4. Diversity
         self.diversity_reward = DiversityReward(num_generations=num_generations)
 
         logger.info("RecRL Composite Reward ready")
@@ -96,60 +72,35 @@ class RecRLCompositeReward:
         prompts: List[str],
         completions: List[str],
         longview_history: Optional[List[List[int]]] = None,
-        target_pids: Optional[List[List[int]]] = None,
         **kwargs
     ) -> List[float]:
-        """
-        Compute composite reward for a batch of completions.
-
-        Args:
-            prompts:          Input prompts  (len = B * G)
-            completions:      Generated SIDs (len = B * G)
-            longview_history: Per-sample longview PID lists (len = B * G)
-            target_pids:      Ground-truth PID lists (passed through)
-            **kwargs:         Passed to sub-rewards (e.g. target_sid for semantic)
-
-        Returns:
-            Composite reward scores (len = B * G)
-        """
         n = len(completions)
-        w = self.weights
 
-        lv_rewards = (
-            self.longview_reward(prompts, completions, longview_history=longview_history)
-            if w.get('longview', 0) > 0 else [0.0] * n
-        )
+        lv_rewards  = self.longview_reward(prompts, completions, longview_history=longview_history)
+        nov_rewards = self.novelty_reward(prompts, completions)
+        div_rewards = self.diversity_reward(prompts, completions)
 
-        sem_rewards = (
-            self.semantic_reward(prompts, completions, **kwargs)
-            if w.get('semantic', 0) > 0 else [0.0] * n
-        )
+        # Multiplicative combination: reward only items that are BOTH relevant AND novel.
+        # lv is clipped to [0, 1] so negative validity penalties don't invert the product.
+        # Multiplicative: only reward items that are BOTH relevant AND novel.
+        # nov < 0 signals an invalid/unresolvable SID — always apply a flat penalty
+        # so invalid generations can never score 0 through cancellation.
+        INVALID_PENALTY = -0.5
+        final_rewards = []
+        for i in range(n):
+            if nov_rewards[i] < 0:
+                final_rewards.append(INVALID_PENALTY)
+            else:
+                final_rewards.append(
+                    max(0.0, lv_rewards[i]) * nov_rewards[i] * self.JOINT_WEIGHT
+                    + div_rewards[i] * self.DIV_WEIGHT
+                )
 
-        nov_rewards = (
-            self.novelty_reward(prompts, completions)
-            if w.get('novelty', 0) > 0 else [0.0] * n
-        )
-
-        div_rewards = (
-            self.diversity_reward(prompts, completions)
-            if w.get('diversity', 0) > 0 else [0.0] * n
-        )
-
-        final_rewards = [
-            w.get('longview',  0) * lv_rewards[i]  +
-            w.get('semantic',  0) * sem_rewards[i]  +
-            w.get('novelty',   0) * nov_rewards[i]  +
-            w.get('diversity', 0) * div_rewards[i]
-            for i in range(n)
-        ]
-
-        # Log component means on first call
-        if not hasattr(self, '_logged_once'):
-            self._logged_once = True
+        self._call_count = getattr(self, '_call_count', 0) + 1
+        if self._call_count % 10 == 1:
             logger.info(
-                f"[Reward breakdown]  "
+                f"[Reward breakdown step={self._call_count}]  "
                 f"lv={sum(lv_rewards)/n:.3f}  "
-                f"sem={sum(sem_rewards)/n:.3f}  "
                 f"nov={sum(nov_rewards)/n:.3f}  "
                 f"div={sum(div_rewards)/n:.3f}  "
                 f"total={sum(final_rewards)/n:.3f}"

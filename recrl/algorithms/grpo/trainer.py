@@ -43,6 +43,7 @@ class GRPOTrainer(BaseRLTrainer):
         completion_ids = inputs["completion_ids"]
         completion_mask = inputs["completion_mask"]
         ref_per_token_logps = inputs["ref_per_token_logps"]
+        old_per_token_logps = inputs["old_per_token_logps"]
         advantages = inputs["advantages"]
 
         # Concatenate prompt and completion
@@ -74,7 +75,8 @@ class GRPOTrainer(BaseRLTrainer):
                        (ref_per_token_logps - per_token_logps) - 1
 
         # Policy gradient loss with importance sampling
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * \
+        # Use old_per_token_logps (rollout snapshot) for correct off-policy ratio
+        per_token_loss = torch.exp(per_token_logps - old_per_token_logps.detach()) * \
                          advantages.unsqueeze(1)
 
         # Combine with KL penalty
