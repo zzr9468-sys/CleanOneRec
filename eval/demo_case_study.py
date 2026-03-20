@@ -31,17 +31,26 @@ SID_PATTERN = re.compile(r"<\|sid_begin\|>.*?<\|sid_end\|>")
 
 def load_prompts(data_path: str, n: int, seed: int = 42):
     import pandas as pd
-    df = pd.read_parquet(data_path).sample(n=n, random_state=seed)
+    df = pd.read_parquet(data_path).sample(n=n, random_state=seed).reset_index(drop=True)
+
     prompts = []
+    longview_lists = []
     for _, row in df.iterrows():
-        msgs = row.get("messages", row.get("prompt", ""))
-        if isinstance(msgs, list):
-            # messages format: [{"role": ..., "content": ...}]
-            text = "\n".join(m["content"] for m in msgs if m.get("role") != "assistant")
-        else:
-            text = str(msgs)
-        prompts.append(text[:1500])   # truncate to avoid OOM
-    return prompts
+        # inter_user_profile_with_sid contains the SID history as context.
+        # End the prompt with <|sid_begin|> so the model directly continues with a SID.
+        profile = str(row.get("inter_user_profile_with_sid", "") or "")[:800]
+        prompt = (
+            f"用户画像（含历史视频SID序列）：\n{profile}\n\n"
+            "根据上述用户历史，下一个推荐视频的语义ID为：<|sid_begin|>"
+        )
+        prompts.append(prompt)
+
+        lv = row.get("hist_longview_video_list")
+        if lv is not None and hasattr(lv, "tolist"):
+            lv = lv.tolist()
+        longview_lists.append(list(lv) if lv is not None else [])
+
+    return prompts, longview_lists
 
 
 def load_sid_freq(recif_path: str):
@@ -90,7 +99,10 @@ def generate_batch(model, tokenizer, prompts, n_seq, temperature, max_new_tokens
     enc = tokenizer(
         prompts, return_tensors="pt", padding=True,
         padding_side="left", add_special_tokens=False,
-    ).to(device)
+    )
+    # Move inputs to the device where embed_tokens lives (handles device_map="auto")
+    input_device = next(model.parameters()).device
+    enc = {k: v.to(input_device) for k, v in enc.items()}
     with torch.no_grad():
         out = model.generate(
             enc["input_ids"],
@@ -113,11 +125,14 @@ def apply_fast_weight(model, tokenizer, prompts, unlearn_lr=1e-5, device="cuda")
     lm_head = model.lm_head
     backup = lm_head.weight.data.clone()
 
+    input_device = next(model.parameters()).device
+
     # Get G1 completions as unlearn target
-    enc = tokenizer(
+    enc_raw = tokenizer(
         prompts, return_tensors="pt", padding=True,
         padding_side="left", add_special_tokens=False,
-    ).to(device)
+    )
+    enc = {k: v.to(input_device) for k, v in enc_raw.items()}
     with torch.no_grad():
         out = model.generate(
             enc["input_ids"],
@@ -127,10 +142,10 @@ def apply_fast_weight(model, tokenizer, prompts, unlearn_lr=1e-5, device="cuda")
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-    completion_ids = out[:, enc["input_ids"].size(1):]
+    completion_ids = out[:, enc["input_ids"].size(1):].to(input_device)
     comp_mask = (completion_ids != tokenizer.pad_token_id).int()
     full_ids = torch.cat([enc["input_ids"], completion_ids], dim=1)
-    full_mask = torch.cat([enc["attention_mask"], comp_mask], dim=1)
+    full_mask = torch.cat([enc["attention_mask"].to(input_device), comp_mask], dim=1)
 
     # Freeze all except lm_head
     for p in model.parameters():
@@ -286,7 +301,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     # 加载数据
-    prompts = load_prompts(args.data_path, args.n_prompts)
+    prompts, longview_lists = load_prompts(args.data_path, args.n_prompts)
     print(f"Loaded {len(prompts)} prompts")
 
     # 加载物品数据
