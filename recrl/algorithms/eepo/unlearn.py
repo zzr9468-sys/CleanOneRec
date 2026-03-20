@@ -106,7 +106,7 @@ class FastWeightUnlearner:
             else:
                 t_ids, t_mask = prompt_ids, prompt_mask
             total_loss = total_loss + self._remember_loss(
-                model, t_ids, t_mask, tail_completion_ids
+                model, t_ids, t_mask, tail_completion_ids, tokenizer
             ) * self.remember_weight
 
         # ── Single SGD step ────────────────────────────────────────────────
@@ -166,9 +166,11 @@ class FastWeightUnlearner:
         prompt_ids: torch.Tensor,
         prompt_mask: torch.Tensor,
         completion_ids: torch.Tensor,
+        tokenizer: PreTrainedTokenizerBase,
     ) -> torch.Tensor:
         """Make model MORE likely to generate tail-item completions (cross-entropy)."""
-        comp_mask = (completion_ids != 0).int()
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        comp_mask = (completion_ids != pad_id).int()
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attn_mask = torch.cat([prompt_mask, comp_mask], dim=1)
 
