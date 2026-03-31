@@ -1,0 +1,61 @@
+# ============================================================
+# Experiment E — EEPO 消融：关闭 Direction 4
+# EEPO（Dir1+2+3 开，Dir4 关）+ 乘法 Reward
+# 目的：量化 G1/G2 独立 Advantage 归一化的净贡献
+#   G1/G2 合并归一化，无 exploration_bonus
+# ============================================================
+
+model_path:  /data/zhouziren/ms/OneRec-1.7B
+data_path:   /data/zhouziren/ms/OpenOneRec-RecIF/benchmark_data/video/video_test.parquet
+recif_path:  /data/zhouziren/ms/OpenOneRec-RecIF
+algo:        eepo
+device:      cuda:0
+
+# Training
+num_epochs:                  1
+per_device_batch_size:       2
+gradient_accumulation_steps: 4
+learning_rate:               5.0e-6
+warmup_steps:                50
+max_grad_norm:               1.0
+
+# Generation
+num_generations:       4
+max_completion_length: 128
+temperature:           0.7
+
+# RL
+beta: 0.04
+
+# Reward
+reward_mode: multiplicative
+
+# EEPO Core
+eepo_enabled:       true
+eepo_stage1_ratio:  0.7
+eepo_unlearn_lr:    1.0e-3
+eepo_unlearn_weight: 1.0
+eepo_epsilon:       1.0e-8
+add_gt:             false
+
+# Direction 1: ON
+eepo_expand_scope: true
+
+# Direction 2: ON
+eepo_stage1_ratio_end:    0.3
+eepo_stage1_anneal_steps: 500
+
+# Direction 3: ON
+eepo_recif_path:      /data/zhouziren/ms/OpenOneRec-RecIF
+eepo_head_k:          500
+eepo_remember_tail:   true
+eepo_remember_weight: 0.3
+eepo_tail_k:          1000
+
+# Direction 4: OFF（G1/G2 合并归一化，无 exploration bonus）
+eepo_separate_adv:      false
+eepo_exploration_bonus: 0.0
+
+# Logging
+logging_steps: 1
+save_steps:    200

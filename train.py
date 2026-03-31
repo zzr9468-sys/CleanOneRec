@@ -55,6 +55,8 @@ def parse_args():
     p.add_argument("--constrained", action="store_true",
                    help="Enable SID trie constrained decoding (slower but always valid)")
     p.add_argument("--seed",    type=int, default=42)
+    p.add_argument("--resume-from", type=str, default=None, dest="resume_from",
+                   help="Resume from checkpoint dir (loads model weights + skips processed steps)")
     return p.parse_args()
 
 
@@ -112,12 +114,27 @@ def main():
         train_config = GRPOConfig(**common)
     else:
         train_config = EEPOConfig(
+            # Core
             eepo_enabled         = cfg.get("eepo_enabled",      True),
-            eepo_stage1_ratio    = cfg.get("eepo_stage1_ratio", 0.5),
+            eepo_stage1_ratio    = cfg.get("eepo_stage1_ratio", 0.7),
             eepo_unlearn_lr      = cfg.get("eepo_unlearn_lr",   1e-5),
             eepo_unlearn_weight  = cfg.get("eepo_unlearn_weight", 1.0),
             eepo_epsilon         = cfg.get("eepo_epsilon",       1e-4),
             add_gt               = cfg.get("add_gt",            False),
+            # Direction 1: Extended fast-weight scope
+            eepo_expand_scope    = cfg.get("eepo_expand_scope", False),
+            # Direction 2: Dynamic stage1 ratio annealing
+            eepo_stage1_ratio_end      = cfg.get("eepo_stage1_ratio_end",   0.3),
+            eepo_stage1_anneal_steps   = cfg.get("eepo_stage1_anneal_steps", 0),
+            # Direction 3: Directed unlearn + bidirectional remember
+            eepo_recif_path      = cfg.get("eepo_recif_path",    RECIF_PATH),
+            eepo_head_k          = cfg.get("eepo_head_k",        500),
+            eepo_remember_tail   = cfg.get("eepo_remember_tail", True),
+            eepo_remember_weight = cfg.get("eepo_remember_weight", 0.3),
+            eepo_tail_k          = cfg.get("eepo_tail_k",        1000),
+            # Direction 4: Separate G1/G2 advantage normalisation
+            eepo_separate_adv    = cfg.get("eepo_separate_adv",  True),
+            eepo_exploration_bonus = cfg.get("eepo_exploration_bonus", 0.1),
             **common,
         )
 
@@ -135,12 +152,17 @@ def main():
     logger.info(f"Loading model from {MODEL_PATH}")
     dtype = torch.bfloat16 if "cuda" in DEVICE else torch.float32
 
+    # If resuming, load weights from checkpoint instead of base model
+    model_load_path = args.resume_from if args.resume_from else MODEL_PATH
+    if args.resume_from:
+        logger.info(f"Resuming from checkpoint: {args.resume_from}")
+
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, dtype=dtype, trust_remote_code=True,
+        model_load_path, dtype=dtype, trust_remote_code=True,
     )
     model.gradient_checkpointing_enable()  # Save GPU memory at cost of ~20% slower training
 
@@ -170,6 +192,7 @@ def main():
         device=DEVICE,
         num_generations=train_config.num_generations,
         weights=cfg.get("reward_weights", None),
+        mode=cfg.get("reward_mode", "multiplicative"),
     )
 
     # ── Trainer ───────────────────────────────────────────────────────────
@@ -185,6 +208,20 @@ def main():
         reward_engine=reward_engine,
         tokenizer=tokenizer,
     )
+
+    # ── Resume: fast-forward scheduler and set skip_steps ────────────────
+    if args.resume_from:
+        import re as _re
+        m = _re.search(r'step_(\d+)', args.resume_from)
+        if m:
+            skip = int(m.group(1))
+            trainer.skip_steps = skip          # train() loop will skip first `skip` batches
+            # trainer.global_step stays at 0 so the < condition works correctly
+            for _ in range(skip):              # fast-forward LR scheduler to match
+                trainer.scheduler.step()
+            logger.info(f"Resumed: will skip first {skip} steps, "
+                        f"lr={trainer.scheduler.get_last_lr()[0]:.2e}")
+
     trainer.train()
 
 

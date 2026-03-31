@@ -1,0 +1,35 @@
+# ============================================================
+# Experiment C — GRPO + Multiplicative Reward（无 EEPO）
+# 目的：回答关键问题 —— 乘法 reward 本身够不够？EEPO 是否冗余？
+#   C ≈ B → fast-weight 机制对长尾帮助有限，需重新评估
+#   C < B → EEPO 提供了 reward 无法替代的结构性探索
+# ============================================================
+
+model_path:  /data/zhouziren/ms/OneRec-1.7B
+data_path:   /data/zhouziren/ms/OpenOneRec-RecIF/benchmark_data/video/video_test.parquet
+recif_path:  /data/zhouziren/ms/OpenOneRec-RecIF
+algo:        grpo
+device:      cuda:0
+
+# Training
+num_epochs:                  1
+per_device_batch_size:       2
+gradient_accumulation_steps: 4
+learning_rate:               5.0e-6
+warmup_steps:                50
+max_grad_norm:               1.0
+
+# Generation
+num_generations:       4
+max_completion_length: 128
+temperature:           0.7
+
+# RL
+beta: 0.04
+
+# Reward — 乘法模式（新公式），无 EEPO
+reward_mode: multiplicative
+
+# Logging
+logging_steps: 1
+save_steps:    200

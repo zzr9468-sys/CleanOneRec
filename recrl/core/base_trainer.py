@@ -98,6 +98,7 @@ class BaseRLTrainer(ABC):
         self.tokenizer = tokenizer
         self.sampler = sampler
         self.global_step = 0
+        self.skip_steps = 0   # set externally before train() to resume mid-epoch
         self._metrics_history: list[dict] = []
 
         # ── Accelerate setup ──────────────────────────────────────────────
@@ -227,6 +228,10 @@ class BaseRLTrainer(ABC):
             )
 
             for step, batch in enumerate(pbar):
+                # ── Resume: skip already-processed steps ──────────────────
+                if self.global_step < self.skip_steps:
+                    self.global_step += 1
+                    continue
                 loss, metrics = self._training_step(batch)
 
                 if is_main and (self.global_step + 1) % self.config.logging_steps == 0:

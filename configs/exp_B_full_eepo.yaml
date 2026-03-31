@@ -1,0 +1,60 @@
+# ============================================================
+# Experiment B — Full EEPO
+# EEPO (4 个 Direction 全开) + 乘法 Reward
+# 目的：验证完整方案效果，与 A 对比
+# ============================================================
+
+model_path:  /data/zhouziren/ms/OneRec-1.7B
+data_path:   /data/zhouziren/ms/OpenOneRec-RecIF/benchmark_data/video/video_test.parquet
+recif_path:  /data/zhouziren/ms/OpenOneRec-RecIF
+algo:        eepo
+device:      cuda:0
+
+# Training
+num_epochs:                  1
+per_device_batch_size:       1
+gradient_accumulation_steps: 8
+learning_rate:               5.0e-6
+warmup_steps:                50
+max_grad_norm:               1.0
+
+# Generation
+num_generations:       4
+max_completion_length: 128
+temperature:           0.7
+
+# RL
+beta: 0.04
+
+# Reward — 乘法模式（新公式）
+reward_mode: multiplicative
+
+# EEPO Core
+eepo_enabled:       true
+eepo_stage1_ratio:  0.7
+eepo_unlearn_lr:    1.0e-3
+eepo_unlearn_weight: 1.0
+eepo_epsilon:       1.0e-8
+add_gt:             false
+
+# Direction 1: Extended fast-weight scope（同时变异 v_proj）
+eepo_expand_scope: true
+
+# Direction 2: Dynamic stage1 ratio annealing（训练前期多利用，后期多探索）
+eepo_stage1_ratio_end:    0.3
+eepo_stage1_anneal_steps: 500
+
+# Direction 3: Directed unlearn（推开 Top-500 热门）+ remember（靠近 Bottom-1000 长尾）
+eepo_recif_path:      /data/zhouziren/ms/OpenOneRec-RecIF
+eepo_head_k:          500
+eepo_remember_tail:   true
+eepo_remember_weight: 0.3
+eepo_tail_k:          1000
+
+# Direction 4: G1/G2 独立 Advantage 归一化 + 探索 bonus
+eepo_separate_adv:      true
+eepo_exploration_bonus: 0.1
+
+# Logging
+logging_steps: 1
+save_steps:    200

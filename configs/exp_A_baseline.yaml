@@ -1,0 +1,38 @@
+# ============================================================
+# Experiment A — Baseline
+# GRPO + Additive Reward (旧公式)
+# 目的：建立基准线，所有实验都与此对比
+# ============================================================
+
+model_path:  /data/zhouziren/ms/OneRec-1.7B
+data_path:   /data/zhouziren/ms/OpenOneRec-RecIF/benchmark_data/video/video_test.parquet
+recif_path:  /data/zhouziren/ms/OpenOneRec-RecIF
+algo:        grpo
+device:      cuda:0
+
+# Training
+num_epochs:                  1
+per_device_batch_size:       2
+gradient_accumulation_steps: 4
+learning_rate:               5.0e-6
+warmup_steps:                50
+max_grad_norm:               1.0
+
+# Generation
+num_generations:       4
+max_completion_length: 128
+temperature:           0.7
+
+# RL
+beta: 0.04
+
+# Reward — 加法模式（旧公式）
+reward_mode: additive
+reward_weights:
+  longview:  0.70
+  novelty:   0.25
+  diversity: 0.05
+
+# Logging
+logging_steps: 1
+save_steps:    200
